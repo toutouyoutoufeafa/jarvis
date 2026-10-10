@@ -57,6 +57,7 @@ class AgentCore:
 
         self._current_task: AgentTask | None = None
         self._running = False
+        self._llm_failures = 0  # Consecutive LLM failures counter
 
     async def initialize(self) -> None:
         await self.memory.initialize()
@@ -113,7 +114,7 @@ class AgentCore:
 
                 if action.get("type") == "plan":
                     task.state = AgentState.PLANNING
-                    task.plan = await self.planner.create_plan(goal, self._build_context(task))
+                    task.plan = await self.planner.create_plan(goal, await self._build_context(task))
                     await self._emit_task_update(task)
 
                 elif action.get("type") == "execute":
@@ -167,7 +168,7 @@ class AgentCore:
             self._current_task = None
             self._running = False
 
-    def _build_context(self, task: AgentTask) -> str:
+    async def _build_context(self, task: AgentTask) -> str:
         """Build context string for LLM."""
         parts = [f"Goal: {task.goal}"]
 
@@ -175,7 +176,7 @@ class AgentCore:
             parts.append(f"Context: {json.dumps(task.context)}")
 
         # Add memory context
-        mem_context = self.memory.get_context(task.goal)
+        mem_context = await self.memory.get_context(task.goal)
         if mem_context:
             parts.append(f"Memory:\n{mem_context}")
 
@@ -226,13 +227,22 @@ JSON:"""
 
         try:
             response = await self.llm.complete(prompt)
+            self._llm_failures = 0  # Reset on success
             logger.debug(f"Agent think: {response[:300]}...")
 
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
         except Exception as e:
-            logger.error(f"Think failed: {e}")
+            self._llm_failures += 1
+            logger.error(f"Think failed ({self._llm_failures} consecutive): {e}")
+
+            if self._llm_failures >= 3:
+                return {
+                    "type": "answer",
+                    "content": f"LLM unavailable after {self._llm_failures} attempts. Error: {e}. Please start Ollama or configure an LLM provider.",
+                    "reasoning": "LLM is unreachable, aborting"
+                }
 
         # Fallback
         return {"type": "wait", "duration": 1, "reasoning": "Error in thinking, waiting"}

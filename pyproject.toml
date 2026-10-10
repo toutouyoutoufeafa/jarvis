@@ -55,6 +55,10 @@ dev = [
 plugins = [
     "aiohttp>=3.9",
 ]
+ui = [
+    "streamlit>=1.35",
+    "streamlit-chat>=0.1.1",
+]
 
 [project.scripts]
 jarvis = "jarvis.cli:app"

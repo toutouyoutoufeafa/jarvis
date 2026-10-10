@@ -281,6 +281,57 @@ class ScreenshotAction(Action):
             return f"Erreur: {e}"
 
 
+class ChatAction(Action):
+    """Basic chat action for greetings and simple conversation (no LLM required)."""
+
+    GREETINGS = {
+        "bonjour": "Bonjour ! Je suis JARVIS, votre assistant personnel. Comment puis-je vous aider ?",
+        "salut": "Salut ! Comment puis-je vous aider aujourd'hui ?",
+        "hello": "Hello! How can I assist you today?",
+        "coucou": "Coucou ! Qu'est-ce que je peux faire pour vous ?",
+        "bonsoir": "Bonsoir ! En quoi puis-je vous aider ce soir ?",
+        "hey": "Hey ! Avez-vous besoin de quelque chose ?",
+    }
+
+    @property
+    def name(self) -> str:
+        return "chat"
+
+    @property
+    def description(self) -> str:
+        return "General conversation, greetings, questions without specific action"
+
+    async def execute(self, entities: dict[str, str], raw_text: str) -> str:
+        text_lower = raw_text.lower().strip()
+
+        # Check greetings
+        for greeting, response in self.GREETINGS.items():
+            if greeting in text_lower:
+                return response
+
+        # Check thanks
+        if any(w in text_lower for w in ["merci", "thanks", "thank you"]):
+            return "De rien ! N'hésitez pas si vous avez d'autres questions."
+
+        # Check how are you
+        if any(w in text_lower for w in ["comment vas-tu", "comment ca va", "how are you", "ça va"]):
+            return "Je vais bien, merci ! Prêt à vous aider. Que puis-je faire pour vous ?"
+
+        # Try LLM for more complex queries
+        try:
+            from jarvis.llm import get_llm_engine
+            llm = get_llm_engine()
+            response = await llm.complete(
+                raw_text,
+                system_prompt="Tu es JARVIS, un assistant IA personnel inspire d'Iron Man. Reponds en francais, de maniere concise et utile."
+            )
+            return response
+        except Exception:
+            return (f"Je suis JARVIS. Pour l'instant, je fonctionne en mode simple sans LLM. "
+                    f"Votre message: '{raw_text}'. "
+                    f"Pour des reponses plus cleveres, demarrez Ollama avec 'ollama serve'.")
+
+
 class VolumeControlAction(Action):
     @property
     def name(self) -> str:
@@ -331,6 +382,7 @@ class IntentRecognizer:
             SystemInfoAction(),
             ScreenshotAction(),
             VolumeControlAction(),
+            ChatAction(),
         ]
         for action in actions:
             self.registry.register(action)
@@ -438,6 +490,7 @@ class ActionExecutor:
     def __init__(self, recognizer: IntentRecognizer) -> None:
         self.recognizer = recognizer
         self.event_bus = get_event_bus()
+        self.llm = get_llm_engine()
 
     async def execute_intent(self, intent: Intent) -> str:
         """Execute an intent and return result."""
@@ -463,7 +516,7 @@ class ActionExecutor:
             response = await self.llm.complete(text)
             return response
         except Exception as e:
-            return f"Désolé, je ne peux pas répondre: {e}"
+            return f"Je ne peux pas repondre pour l'instant (LLM indisponible). Votre message: '{text}'. Demarrez Ollama avec 'ollama serve' ou configurez un fournisseur LLM dans config.yaml."
 
     async def process_text(self, text: str) -> str:
         """Full pipeline: recognize intent -> execute -> return response."""
