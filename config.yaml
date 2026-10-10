@@ -1,0 +1,148 @@
+# JARVIS Configuration
+# Copy to config.yaml and customize
+
+assistant:
+  name: "JARVIS"
+  wake_word: "jarvis"           # Mot de réveil (pour plus tard)
+  language: "fr"                # fr / en
+  response_timeout: 30.0        # Timeout réponse LLM (sec)
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  chunk_size: 1024
+  input_device: null            # null = défaut, ou index device
+  output_device: null
+  vad_threshold: 0.5            # Voice Activity Detection (0-1)
+  silence_duration: 1.5         # Secondes de silence pour finir l'énoncé
+
+stt:
+  engine: "faster-whisper"      # faster-whisper / whisper.cpp / openai
+  model: "base"                 # tiny, base, small, medium, large-v3
+  device: "auto"                # auto, cpu, cuda
+  compute_type: "auto"          # auto, int8, float16, float32
+  language: "fr"
+  beam_size: 5
+
+tts:
+  engine: "piper"               # piper / coqui / openai / elevenlabs
+  voice: "fr_FR-siwis-medium"   # Voir https://huggingface.co/rhasspy/piper-voices
+  speed: 1.0
+  # openai/elevenlabs options (si engine cloud)
+  openai_voice: "onyx"          # alloy, echo, fable, onyx, nova, shimmer
+  elevenlabs_voice_id: ""
+
+llm:
+  default_provider: "ollama"    # ollama / openai / anthropic
+  providers:
+    ollama:
+      base_url: "http://localhost:11434"
+      model: "llama3.1:8b"
+      temperature: 0.7
+      max_tokens: 4096
+    openai:
+      api_key: "${OPENAI_API_KEY}"
+      model: "gpt-4o-mini"
+      temperature: 0.7
+      max_tokens: 4096
+    anthropic:
+      api_key: "${ANTHROPIC_API_KEY}"
+      model: "claude-3-5-sonnet-20241022"
+      temperature: 0.7
+      max_tokens: 4096
+
+system_control:
+  enabled: true
+  allowed_apps:                 # Apps autorisées à lancer
+    - "code"
+    - "chrome"
+    - "firefox"
+    - "notepad"
+    - "explorer"
+    - "cmd"
+    - "powershell"
+  allowed_paths:                # Chemins autorisés pour fichiers
+    - "C:\\Users\\${USERNAME}\\Documents"
+    - "C:\\Users\\${USERNAME}\\Desktop"
+    - "D:\\Projects"
+
+plugins:
+  enabled: true
+  directories:
+    - "plugins"
+    - "~/.jarvis/plugins"
+
+logging:
+  level: "INFO"                 # DEBUG, INFO, WARNING, ERROR
+  file: "logs/jarvis.log"
+  rotation: "10 MB"
+  retention: "7 days"
+
+ui:
+  tray_icon: true
+  notifications: true
+  show_waveform: false
+
+agent:
+  sandbox:
+    enabled: true
+    type: "subprocess"  # subprocess / docker
+    docker_image: "python:3.11-slim"
+    timeout: 30
+    memory_limit: "512m"
+    cpu_limit: 1.0
+    network_enabled: false
+    allowed_paths:
+      - "C:\\Users\\${USERNAME}\\jarvis_workspace"
+      - "/tmp/jarvis"
+
+  memory:
+    enabled: true
+    vector_db_path: "~/.jarvis/memory/chroma"
+    embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+    stm_max_tokens: 4000
+    ltm_max_entries: 10000
+    auto_summarize: true
+    summarize_threshold: 100
+
+  planner:
+    enabled: true
+    max_steps: 20
+    max_retries: 3
+    planning_model: ""
+    use_cot: true
+
+  designer:
+    enabled: true
+    templates_path: "~/.jarvis/templates"
+    default_language: "python"
+    auto_test: true
+    lint_before_save: true
+
+  monitor:
+    enabled: true
+    check_interval: 60
+    log_paths:
+      - "C:\\Windows\\System32\\winevt\\Logs\\System.evtx"
+      - "~/.jarvis/logs/jarvis.log"
+    metrics_interval: 30
+    alert_thresholds:
+      cpu_percent: 90.0
+      memory_percent: 85.0
+      disk_percent: 90.0
+
+  reflector:
+    enabled: true
+    reflection_depth: 3
+    critique_model: ""
+    auto_improve: true
+
+  spawner:
+    enabled: true
+    max_concurrent_agents: 5
+    default_timeout: 300
+    token_budget_per_agent: 50000
+
+  default_model: "llama3.1:8b"
+  max_iterations: 50
+  verbose: true

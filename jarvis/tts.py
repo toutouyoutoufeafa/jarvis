@@ -1,0 +1,209 @@
+"""Text-to-Speech using Piper (local) with cloud fallback."""
+from __future__ import annotations
+
+import asyncio
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import requests
+import soundfile as sf
+from loguru import logger
+
+from jarvis.config import get_config
+from jarvis.events import Event, Events, get_event_bus
+
+
+class TTSEngine:
+    """TTS engine with Piper (local) and cloud fallback."""
+
+    def __init__(self) -> None:
+        self.config = get_config()
+        self.event_bus = get_event_bus()
+        self._piper_path: Optional[Path] = None
+        self._voice_path: Optional[Path] = None
+
+    async def initialize(self) -> None:
+        if self.config.tts.engine == "piper":
+            await self._init_piper()
+
+    async def _init_piper(self) -> None:
+        """Find or download Piper binary and voice model."""
+        # Check for piper in PATH or local
+        try:
+            result = subprocess.run(["piper", "--version"], capture_output=True, text=True)
+            if result.returncode == 0:
+                self._piper_path = Path("piper")
+                logger.info("Found Piper in PATH")
+        except FileNotFoundError:
+            pass
+
+        # Check local bin directory
+        local_bin = Path.home() / ".local" / "bin" / "piper"
+        if local_bin.exists():
+            self._piper_path = local_bin
+
+        if self._piper_path is None:
+            logger.warning("Piper not found. Install with: pip install piper-tts")
+            logger.warning("Or download from: https://github.com/rhasspy/piper/releases")
+
+        # Voice model path
+        voice_name = self.config.tts.voice
+        # Piper voices are typically at ~/.local/share/piper/voices/
+        voice_dirs = [
+            Path.home() / ".local" / "share" / "piper" / "voices",
+            Path("/usr/share/piper/voices"),
+            Path.cwd() / "voices",
+        ]
+        for d in voice_dirs:
+            for ext in [".onnx", ".onnx.json"]:
+                vp = d / f"{voice_name}{ext}"
+                if vp.exists():
+                    self._voice_path = vp
+                    break
+            if self._voice_path:
+                break
+
+        if self._voice_path:
+            logger.info(f"Using Piper voice: {self._voice_path}")
+        else:
+            logger.warning(f"Voice not found: {voice_name}. Download from https://huggingface.co/rhasspy/piper-voices")
+
+    async def synthesize(self, text: str) -> np.ndarray:
+        """Synthesize text to audio (int16 array)."""
+        engine = self.config.tts.engine
+
+        if engine == "piper":
+            return await self._synthesize_piper(text)
+        elif engine == "openai":
+            return await self._synthesize_openai(text)
+        elif engine == "elevenlabs":
+            return await self._synthesize_elevenlabs(text)
+        else:
+            raise ValueError(f"Unknown TTS engine: {engine}")
+
+    async def _synthesize_piper(self, text: str) -> np.ndarray:
+        if self._piper_path is None or self._voice_path is None:
+            raise RuntimeError("Piper not initialized. Run initialize() first.")
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        try:
+            # Build command
+            cmd = [
+                str(self._piper_path),
+                "--model", str(self._voice_path),
+                "--output_file", str(tmp_path),
+                "--length_scale", str(1.0 / self.config.tts.speed),
+            ]
+
+            # Run piper
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate(input=text.encode())
+
+            if proc.returncode != 0:
+                raise RuntimeError(f"Piper failed: {stderr.decode()}")
+
+            # Load generated audio
+            audio_data, _ = sf.read(tmp_path, dtype='int16')
+            return audio_data
+
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    async def _synthesize_openai(self, text: str) -> np.ndarray:
+        """OpenAI TTS API."""
+        provider = self.config.llm.providers.get("openai")
+        if not provider or not provider.api_key:
+            raise RuntimeError("OpenAI API key not configured")
+
+        url = "https://api.openai.com/v1/audio/speech"
+        headers = {
+            "Authorization": f"Bearer {provider.api_key}",
+            "Content-Type": "application/json",
+        }
+        data = {
+            "model": "tts-1",
+            "voice": self.config.tts.openai_voice,
+            "input": text,
+            "speed": self.config.tts.speed,
+        }
+
+        response = await asyncio.to_thread(requests.post, url, headers=headers, json=data, timeout=30)
+        response.raise_for_status()
+
+        # Save to temp and load
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp.write(response.content)
+            tmp_path = Path(tmp.name)
+
+        try:
+            audio_data, _ = sf.read(tmp_path, dtype='int16')
+            return audio_data
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    async def _synthesize_elevenlabs(self, text: str) -> np.ndarray:
+        """ElevenLabs TTS API."""
+        voice_id = self.config.tts.elevenlabs_voice_id
+        if not voice_id:
+            raise RuntimeError("ElevenLabs voice ID not configured")
+
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        headers = {
+            "xi-api-key": self.config.llm.providers.get("elevenlabs", {}).api_key or "",
+            "Content-Type": "application/json",
+        }
+        data = {
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        }
+
+        response = await asyncio.to_thread(requests.post, url, headers=headers, json=data, timeout=30)
+        response.raise_for_status()
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp.write(response.content)
+            tmp_path = Path(tmp.name)
+
+        try:
+            audio_data, _ = sf.read(tmp_path, dtype='int16')
+            return audio_data
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    async def process_event(self, event: Event) -> None:
+        """Handle TTS_START event."""
+        text = event.data.get("text", "")
+        if not text:
+            return
+
+        await self.event_bus.emit(Event(Events.TTS_START, {"text": text}))
+
+        try:
+            audio = await self.synthesize(text)
+            await self.event_bus.emit(Event(Events.TTS_CHUNK, {"audio": audio}))
+            await self.event_bus.emit(Event(Events.TTS_END, {"text": text}))
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
+            await self.event_bus.emit(Event(Events.TTS_ERROR, {"error": str(e), "text": text}))
+
+
+# Global instance
+_tts_engine: TTSEngine | None = None
+
+
+def get_tts_engine() -> TTSEngine:
+    global _tts_engine
+    if _tts_engine is None:
+        _tts_engine = TTSEngine()
+    return _tts_engine

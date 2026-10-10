@@ -1,0 +1,82 @@
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Personal AI assistant inspired by JARVIS from Iron Man"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Core
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    # Async & Concurrency
+    "anyio>=4.4",
+    # Audio / Voice
+    "sounddevice>=0.4.7",
+    "soundfile>=0.12",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    # STT (Local)
+    "faster-whisper>=1.1",
+    # TTS (Local)
+    "piper-tts>=1.2",
+    # LLM
+    "openai>=1.30",
+    "ollama>=0.3",
+    "httpx>=0.27",
+    # System Control
+    "psutil>=5.9",
+    "pyautogui>=0.9",
+    "screeninfo>=0.8",
+    # Plugin System
+    "pluggy>=1.5",
+    # Agent System
+    "chromadb>=0.5",
+    "sentence-transformers>=3.0",
+    "docker>=7.0",
+    "tenacity>=8.3",
+    "croniter>=2.0",
+    "watchdog>=4.0",
+    # Logging & CLI
+    "loguru>=0.7",
+    "typer>=0.12",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+]
+plugins = [
+    "aiohttp>=3.9",
+]
+
+[project.scripts]
+jarvis = "jarvis.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jarvis*"]
+exclude = ["plugins*", "jarvis_workspace*", "tests*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "UP", "W", "C4", "PTH", "RUF", "TRY", "SIM", "TID", "ARG", "N", "PL", "RET", "ASYNC"]
+ignore = ["S101", "TRY003"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
