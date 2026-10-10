@@ -55,6 +55,7 @@ class OllamaProvider(LLMProvider):
             "model": self.model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
             "stream": stream,
+            "think": False,  # Disable thinking for faster responses (nemotron, etc.)
             "options": {
                 "temperature": self.temperature,
                 "num_predict": self.max_tokens,
@@ -283,6 +284,10 @@ Be proactive but not verbose. Use a professional yet friendly tone."""
         stream: bool = False,
     ) -> str | AsyncIterator[str]:
         """Complete a user request."""
+        # Lazy initialize providers if not yet loaded
+        if not self._providers:
+            await self.initialize()
+
         llm_provider = self.get_provider(provider)
         if not llm_provider:
             raise RuntimeError("No LLM provider available")

@@ -131,6 +131,9 @@ class ToolRegistry:
     def list_tools(self) -> list[Tool]:
         return list(self._tools.values())
 
+    def list_names(self) -> list[str]:
+        return list(self._tools.keys())
+
     def get_schemas(self) -> list[ToolSchema]:
         return [tool.get_schema() for tool in self._tools.values()]
 

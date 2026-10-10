@@ -131,24 +131,35 @@ async def check_llm_available() -> bool:
 
 
 async def process_user_message(text: str, use_agent: bool = True) -> str:
-    """Process user message through JARVIS."""
+    """Process user message through JARVIS with smart routing."""
     agent_core = st.session_state.agent_core
     llm_available = st.session_state.get("llm_available", False)
 
-    if use_agent and agent_core and llm_available:
-        # Use full agent system (requires LLM)
-        task = await agent_core.run_task(text)
-        if task.result:
-            return task.result
-        elif task.error:
-            return f"Erreur: {task.error}"
-        else:
-            return "Termine (pas de resultat textuel)"
-    else:
-        # Use simple intent executor (no LLM required)
-        from jarvis.intent import get_action_executor
-        executor = get_action_executor()
-        return await executor.process_text(text)
+    # Step 1: Check if it matches a known intent (system commands, files, etc.)
+    from jarvis.intent import get_intent_recognizer, get_action_executor
+    recognizer = get_intent_recognizer()
+    executor = get_action_executor()
+    intent = await recognizer.recognize(text)
+
+    # If intent has high confidence and is NOT chat, execute it directly
+    if intent.confidence >= 0.7 and intent.name != "chat":
+        return await executor.execute_intent(intent)
+
+    # Step 2: If LLM available, use direct chat (faster than agent for small models)
+    if llm_available:
+        from jarvis.llm import get_llm_engine
+        llm = get_llm_engine()
+        try:
+            response = await llm.complete(
+                text,
+                system_prompt="Tu es JARVIS, un assistant IA personnel inspire d'Iron Man. Reponds en francais, de maniere concise et utile. Si la tache necessite des outils (fichiers, shell, etc.), reponds DIRECT avec ce que tu ferais."
+            )
+            return response
+        except Exception as e:
+            return f"Erreur LLM: {e}"
+
+    # Step 3: Fallback to intent executor (handles chat, system commands without LLM)
+    return await executor.process_text(text)
 
 
 def send_message(text: str, use_agent: bool = True):

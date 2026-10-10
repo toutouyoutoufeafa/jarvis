@@ -37,9 +37,9 @@ llm:
   providers:
     ollama:
       base_url: "http://localhost:11434"
-      model: "llama3.1:8b"
+      model: "nemotron-3-nano:4b"
       temperature: 0.7
-      max_tokens: 4096
+      max_tokens: 1024
     openai:
       api_key: "${OPENAI_API_KEY}"
       model: "gpt-4o-mini"
@@ -143,6 +143,6 @@ agent:
     default_timeout: 300
     token_budget_per_agent: 50000
 
-  default_model: "llama3.1:8b"
-  max_iterations: 50
+  default_model: "nemotron-3-nano:4b"
+  max_iterations: 10
   verbose: true

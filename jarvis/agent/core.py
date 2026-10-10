@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -196,32 +197,22 @@ class AgentCore:
         """Decide next action using LLM."""
         context = await self._build_context(task)
 
-        tool_schemas = self.tools.get_openai_schemas()
-        tools_desc = json.dumps(tool_schemas, indent=2)
+        # Lightweight tool list: only names, not full schemas (small-model friendly)
+        tool_names = self.tools.list_names()
+        tools_desc = ", ".join(tool_names)
 
-        prompt = f"""You are JARVIS, an autonomous agent. Decide the next action to achieve the goal.
+        prompt = f"""You are JARVIS, an autonomous agent.
+GOAL: {task.goal}
 
 {context}
 
-AVAILABLE TOOLS:
-{tools_desc}
+TOOLS: {tools_desc}
 
-ACTION TYPES:
-- "plan": Create a new multi-step plan (use when goal is complex)
-- "execute": Execute the current plan
-- "tool": Call a single tool directly (use for simple actions)
-- "answer": Task complete, return final result
-- "wait": Wait before next iteration
-
-Return ONLY valid JSON:
-{{
-  "type": "plan|execute|tool|answer|wait",
-  "tool": "tool_name",  // required if type=tool
-  "args": {{}},         // required if type=tool
-  "content": "...",     // required if type=answer
-  "duration": 1,        // required if type=wait
-  "reasoning": "why this action"
-}}
+Choose ONE action. Reply with ONLY JSON:
+{{"type":"tool","tool":"tool_name","args":{{}}}} or
+{{"type":"answer","content":"final result"}} or
+{{"type":"plan"}} or
+{{"type":"execute"}}
 
 JSON:"""
 
@@ -252,14 +243,9 @@ JSON:"""
         if task.plan:
             return all(s.status == "done" for s in task.plan.steps)
 
+        # If agent produced a result, trust it (avoids extra LLM call on small models)
         if task.result:
-            # Verify with LLM
-            prompt = f"""Goal: {task.goal}
-Result: {task.result}
-
-Is the goal fully achieved? Answer only YES or NO."""
-            response = await self.llm.complete(prompt)
-            return "YES" in response.upper()
+            return True
 
         return False
 
