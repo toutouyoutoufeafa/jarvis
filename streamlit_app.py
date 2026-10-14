@@ -10,30 +10,9 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Number of past exchanges (user+assistant pairs) sent to the LLM
-MAX_HISTORY_TURNS = 10
-
-# System prompt: persona + few-shot examples + behaviour rules
-SYSTEM_PROMPT = """Tu es JARVIS, l'assistant IA personnel de Tony (inspire d'Iron Man).
-Tu reponds TOUJOURS en francais, de facon concise et utile.
-
-REGLES:
-- Sois direct: reponds en 1 a 4 phrases sauf si on te demande du detail.
-- Tu as acces a des outils (fichiers, shell, web, git). Si une action est demandee,
-  fais-la ou explique exactement la commande a executer.
-- Tu te souviens des echanges precedents: appelle l'utilisateur Tony.
-- Si tu ne sais pas, dis-le franchement au lieu d'inventer.
-- N'utilise pas de markdown lourd dans le chat: du texte simple.
-
-EXEMPLES:
-Utilisateur: Bonjour
-JARVIS: Bonjour Tony. Je suis en ligne et pret a travailler.
-
-Utilisateur: Tu t'en souviens?
-JARVIS: Oui, on a discute plus tot dans cette session. Quoi de neuf?
-
-Utilisateur: Cree un fichier test.py
-JARVIS: Je vais creer test.py avec un script de base."""
+# The conversational turn (intent -> LLM chat -> fallback) lives in
+# jarvis.chat so the CLI, the voice loop and the tests share one routing.
+from jarvis.chat import respond  # noqa: E402
 
 # Configure page
 st.set_page_config(
@@ -165,44 +144,15 @@ async def process_user_message(
 
     NOTE: runs in a worker thread, so it must NOT touch ``st.session_state``.
     All session data is passed in explicitly by ``send_message``.
+    The routing itself lives in :mod:`jarvis.chat`.
     """
-    # Step 1: Check if it matches a known intent (system commands, files, etc.)
-    from jarvis.intent import get_intent_recognizer, get_action_executor
-    recognizer = get_intent_recognizer()
-    executor = get_action_executor()
-    intent = await recognizer.recognize(text)
-
-    # If intent has high confidence and is NOT chat, execute it directly
-    if intent.confidence >= 0.7 and intent.name != "chat":
-        return await executor.execute_intent(intent)
-
-    # Step 2: If LLM available, use direct chat (faster than agent for small models)
-    if llm_available:
-        from jarvis.llm import get_llm_engine, Message
-        llm = get_llm_engine()
-        try:
-            # Apply user-selected model (persists across reruns)
-            if llm_model:
-                llm.set_model(llm_model)
-
-            # Rebuild conversation history so JARVIS remembers previous turns
-            history = [
-                Message(role=m["role"], content=m["content"])
-                for m in messages_snapshot[:-1]  # exclude current user msg
-                if m.get("role") in ("user", "assistant")
-            ][-MAX_HISTORY_TURNS * 2:]  # cap context size
-
-            response = await llm.complete(
-                text,
-                system_prompt=SYSTEM_PROMPT,
-                history=history,
-            )
-            return response
-        except Exception as e:
-            return f"Erreur LLM: {e}"
-
-    # Step 3: Fallback to intent executor (handles chat, system commands without LLM)
-    return await executor.process_text(text)
+    reply = await respond(
+        text,
+        snapshot=messages_snapshot[:-1],  # exclude current user msg
+        llm_available=llm_available,
+        model=llm_model,
+    )
+    return reply.text
 
 
 def send_message(text: str, use_agent: bool = True):

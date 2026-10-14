@@ -18,7 +18,15 @@ from pydantic import BaseModel
 
 from jarvis.config import get_config
 from jarvis.events import Event, Events, get_event_bus
-from jarvis.llm import get_llm_engine, Message
+from jarvis.llm import Message, extract_json, get_llm_engine
+
+# Budget for the intent-classification call. Left at the provider default
+# (1024 tokens, temperature 0.7) a single "what does the user want?"
+# round-trip measured 14-17s on local CPU -- more than the answer itself.
+INTENT_LLM_OPTIONS = {"num_predict": 48, "temperature": 0.0}
+
+# Budget for the executor's general-chat fallback.
+CHAT_LLM_OPTIONS = {"num_predict": 300, "temperature": 0.7}
 
 
 @dataclass
@@ -281,6 +289,24 @@ class ScreenshotAction(Action):
             return f"Erreur: {e}"
 
 
+def canned_reply(text: str) -> str | None:
+    """Instant answers for social formulas.
+
+    These must never reach the LLM: a greeting answered in 25s feels broken.
+    Greetings are matched exactly so that "bonjour, pourquoi le ciel est-il
+    bleu ?" still goes to the model.
+    """
+    stripped = text.strip().lower().rstrip("!?.,;:")
+    if stripped in ChatAction.GREETINGS:
+        return ChatAction.GREETINGS[stripped]
+    if any(word in stripped for word in ("merci", "thanks", "thank you")):
+        return "De rien ! N'hésitez pas si vous avez d'autres questions."
+    if stripped in ("comment vas-tu", "comment vas tu", "comment ca va",
+                    "comment ça va", "ça va", "ca va", "how are you"):
+        return "Je vais bien, merci ! Prêt à vous aider. Que puis-je faire pour vous ?"
+    return None
+
+
 class ChatAction(Action):
     """Basic chat action for greetings and simple conversation (no LLM required)."""
 
@@ -302,20 +328,9 @@ class ChatAction(Action):
         return "General conversation, greetings, questions without specific action"
 
     async def execute(self, entities: dict[str, str], raw_text: str) -> str:
-        text_lower = raw_text.lower().strip()
-
-        # Check greetings
-        for greeting, response in self.GREETINGS.items():
-            if greeting in text_lower:
-                return response
-
-        # Check thanks
-        if any(w in text_lower for w in ["merci", "thanks", "thank you"]):
-            return "De rien ! N'hésitez pas si vous avez d'autres questions."
-
-        # Check how are you
-        if any(w in text_lower for w in ["comment vas-tu", "comment ca va", "how are you", "ça va"]):
-            return "Je vais bien, merci ! Prêt à vous aider. Que puis-je faire pour vous ?"
+        instant = canned_reply(raw_text)
+        if instant:
+            return instant
 
         # Try LLM for more complex queries
         try:
@@ -389,17 +404,16 @@ class IntentRecognizer:
 
     def build_intent_prompt(self, text: str) -> str:
         actions_desc = self.registry.get_descriptions()
-        return f"""Analyse la demande de l'utilisateur et détermine l'intention.
+        return f"""Analyse la demande de l'utilisateur et determine l'intention.
 
 Actions disponibles:
 {actions_desc}
 
-Réponds UNIQUEMENT en JSON valide avec ce format:
+Reponds UNIQUEMENT en JSON valide avec ce format:
 {{
   "intent": "nom_action",
   "confidence": 0.0-1.0,
-  "entities": {{"clé": "valeur"}},
-  "reasoning": "explication brève"
+  "entities": {{"cle": "valeur"}}
 }}
 
 Si aucune action ne correspond, utilise "intent": "chat" avec confidence < 0.5.
@@ -409,54 +423,77 @@ Demande: "{text}"
 JSON:"""
 
     async def recognize(self, text: str) -> Intent:
-        """Recognize intent from text."""
-        prompt = self.build_intent_prompt(text)
+        """Recognize intent from text.
+
+        Deterministic rules run first and cost nothing. The LLM is only
+        consulted for phrasings the rules miss -- at the provider default
+        budget a single classification round-trip measured 14-17s on this
+        CPU-only machine, i.e. more than the answer itself.
+        """
+        rule_intent = self._fallback_recognize(text)
+        if rule_intent.name != "chat":
+            await self._emit(rule_intent)
+            return rule_intent
+
+        # A plain question ("pourquoi ...?", "c'est quoi ...?") is chat by
+        # construction, and paying an LLM round-trip to confirm that is the
+        # single biggest avoidable latency in the chat path.
+        if self._looks_like_question(text):
+            await self._emit(rule_intent)
+            return rule_intent
 
         try:
-            response = await self.llm.complete(prompt)
+            response = await self.llm.complete(
+                self.build_intent_prompt(text), options=INTENT_LLM_OPTIONS
+            )
             logger.debug(f"LLM intent response: {response}")
 
-            # Parse JSON from response
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                import json
-                data = json.loads(json_match.group())
+            data = extract_json(response)
+            if isinstance(data, dict) and data.get("intent"):
                 intent = Intent(
-                    name=data.get("intent", "chat"),
-                    confidence=float(data.get("confidence", 0.0)),
-                    entities=data.get("entities", {}),
+                    name=str(data["intent"]),
+                    confidence=float(data.get("confidence", 0.0) or 0.0),
+                    entities=data.get("entities") or {},
                     raw_text=text,
                 )
-                # Emit event for plugins
-                await self.event_bus.emit(Event(Events.INTENT_RECOGNIZED, {
-                    "intent": intent.name,
-                    "confidence": intent.confidence,
-                    "entities": intent.entities,
-                    "raw_text": intent.raw_text,
-                }))
+                await self._emit(intent)
                 return intent
         except Exception as e:
             logger.error(f"Intent recognition failed: {e}")
 
-        # Fallback: simple keyword matching
-        intent = self._fallback_recognize(text)
+        await self._emit(rule_intent)
+        return rule_intent
+
+    async def _emit(self, intent: Intent) -> None:
         await self.event_bus.emit(Event(Events.INTENT_RECOGNIZED, {
             "intent": intent.name,
             "confidence": intent.confidence,
             "entities": intent.entities,
             "raw_text": intent.raw_text,
         }))
-        return intent
+
+    @staticmethod
+    def _looks_like_question(text: str) -> bool:
+        """Cheap test for 'this is conversation, not a command'."""
+        stripped = text.strip().lower()
+        if stripped.endswith("?"):
+            return True
+        return stripped.startswith((
+            "pourquoi", "comment", "quel", "quelle", "quels", "quelles",
+            "qu'est-ce", "c'est quoi", "qui ", "est-ce que", "peux-tu",
+            "peux tu", "pourrais-tu", "pourrais tu", "tu peux", "savez-vous",
+        ))
 
     def _fallback_recognize(self, text: str) -> Intent:
         text_lower = text.lower()
 
-        # Simple patterns
+        # Simple patterns. Infinitive and question forms matter: "peux-tu
+        # ouvrir chrome ?" must not be mistaken for small talk.
         patterns = [
-            (r"(lance|ouvre|démarre)\s+(\w+)", "launch_app", {"app": r"\2"}),
-            (r"(ouvre|va sur)\s+(https?://\S+|\w+\.\w+)", "open_website", {"url": r"\2"}),
-            (r"(système|info|status|état)", "system_info", {}),
-            (r"(capture|screenshot|écran)", "screenshot", {}),
+            (r"(lance|lancer|ouvre|ouvrir|demarrer|d[eé]marrer)\s+([\w.+-]+)", "launch_app", {"app": r"\2"}),
+            (r"(ouvre|ouvrir|va sur)\s+(https?://\S+|\w+\.\w+)", "open_website", {"url": r"\2"}),
+            (r"(syst[eè]me|info|status|[ée]tat)", "system_info", {}),
+            (r"(capture|screenshot|[ée]cran)", "screenshot", {}),
             (r"(volume|son)\s+(monte|augmente|up)", "volume_control", {"action": "up"}),
             (r"(volume|son)\s+(baisse|descends|down)", "volume_control", {"action": "down"}),
             (r"(volume|son)\s+(muet|mute)", "volume_control", {"action": "mute"}),
@@ -513,8 +550,12 @@ class ActionExecutor:
     async def _chat_fallback(self, text: str) -> str:
         """Fallback to general chat with LLM."""
         try:
-            response = await self.llm.complete(text)
-            return response
+            # Delegate to the shared chat pipeline so the persona, the
+            # history shaping and the generation cap all match the UI.
+            from jarvis.chat import SYSTEM_PROMPT
+            return await self.llm.complete(
+                text, system_prompt=SYSTEM_PROMPT, options=CHAT_LLM_OPTIONS
+            )
         except Exception as e:
             return f"Je ne peux pas repondre pour l'instant (LLM indisponible). Votre message: '{text}'. Demarrez Ollama avec 'ollama serve' ou configurez un fournisseur LLM dans config.yaml."
 

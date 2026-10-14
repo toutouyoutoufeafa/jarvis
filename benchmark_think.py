@@ -1,50 +1,54 @@
-"""Run the real agent task while timing every LLM call."""
+"""Where does a chat turn spend its time?"""
 import asyncio
-import os
 import time
-from pathlib import Path
 
-from jarvis.agent.core import AgentCore
+from jarvis.chat import SYSTEM_PROMPT, build_history
+from jarvis.intent import get_intent_recognizer
+from jarvis.llm import get_llm_engine
 
 
 async def main() -> None:
-    core = AgentCore()
-    core._register_builtin_tools()
-    await core.initialize()
+    recognizer = get_intent_recognizer()
+    llm = get_llm_engine()
+    await llm.initialize()
 
-    calls = []
-    original = core.llm.complete
+    questions = [
+        "Bonjour",
+        "C'est quoi la photosynthese ?",
+        "Et pourquoi les feuilles sont-elles vertes ?",
+    ]
+    snapshot: list[dict] = []
 
-    async def timed(user_input, *args, **kwargs):
-        start = time.perf_counter()
-        out = await original(user_input, *args, **kwargs)
-        elapsed = time.perf_counter() - start
-        calls.append(elapsed)
-        system = kwargs.get("system_prompt") or ""
-        print(f"  LLM {elapsed:6.2f}s  user={len(user_input):5d} chars  "
-              f"sys={len(system):5d} chars")
-        return out
+    for question in questions:
+        t0 = time.perf_counter()
+        await recognizer.recognize(question)
+        t_intent = time.perf_counter() - t0
 
-    core.llm.complete = timed
+        history = build_history(snapshot[:-1])
+        t0 = time.perf_counter()
+        response = await llm.complete(
+            question,
+            system_prompt=SYSTEM_PROMPT,
+            history=history,
+            options={"num_predict": chat_tokens()},
+        )
+        t_llm = time.perf_counter() - t0
 
-    model = os.environ.get("JARVIS_BENCH_MODEL")
-    if model:
-        core.llm.set_model(model)
-    print(f"modele: {core.llm.get_model()}")
+        prompt_chars = len(SYSTEM_PROMPT) + sum(
+            len(m.content) for m in history
+        ) + len(question)
+        print(
+            f"intent={t_intent:5.2f}s  llm={t_llm:6.2f}s  "
+            f"prompt={prompt_chars:5d} chars (~{prompt_chars // 3} tokens)  "
+            f"reponse={len(response)} chars"
+        )
+        snapshot.append({"role": "user", "content": question})
+        snapshot.append({"role": "assistant", "content": response})
 
-    start = time.perf_counter()
-    task = await core.run_task("Cree un fichier vitesse.py qui affiche VITE")
-    total = time.perf_counter() - start
 
-    workspace = Path.home() / ".jarvis" / "workspace"
-    produced = (workspace / "vitesse.py").read_text(encoding="utf-8") \
-        if (workspace / "vitesse.py").exists() else "(absent)"
-
-    print(f"\nTOTAL  : {total:.1f}s")
-    print(f"appels : {len(calls)} LLM, cumules {sum(calls):.1f}s")
-    print(f"state  : {task.state.value}  iterations={task.iterations}")
-    print(f"result : {task.result}")
-    print(f"fichier: {produced!r}")
+def chat_tokens() -> int:
+    from jarvis.chat import CHAT_MAX_TOKENS
+    return CHAT_MAX_TOKENS
 
 
 if __name__ == "__main__":
