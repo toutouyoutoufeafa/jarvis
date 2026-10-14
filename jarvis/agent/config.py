@@ -77,6 +77,33 @@ class SpawnerConfig(BaseSettings):
     token_budget_per_agent: int = 50000
 
 
+class _AgentYamlSource:
+    """pydantic-settings source returning the `agent:` section of config.yaml.
+
+    Priority: init kwargs > env > .env > YAML, so environment variables can
+    still override file-based configuration.
+    """
+
+    def __init__(self, settings_cls: type) -> None:
+        self.settings_cls = settings_cls
+
+    def __call__(self) -> dict:
+        try:
+            import yaml
+
+            from jarvis.config import find_config_file
+
+            path = find_config_file()
+            if path is None:
+                return {}
+            with open(path, encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh) or {}
+            section = raw.get("agent")
+            return section if isinstance(section, dict) else {}
+        except Exception:
+            return {}
+
+
 class AgentConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -94,11 +121,29 @@ class AgentConfig(BaseSettings):
     spawner: SpawnerConfig = Field(default_factory=SpawnerConfig)
 
     # Global
-    default_model: str = Field(default="llama3.1:8b")
-    max_iterations: int = Field(default=50)
+    default_model: str = Field(default="nemotron-3-nano:4b")
+    max_iterations: int = Field(default=10)
     verbose: bool = Field(default=True)
 
-    # Global instance
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            _AgentYamlSource(settings_cls),
+            file_secret_settings,
+        )
+
+
+# Global instance
 _agent_config: AgentConfig | None = None
 
 
@@ -107,3 +152,16 @@ def get_agent_config() -> AgentConfig:
     if _agent_config is None:
         _agent_config = AgentConfig()
     return _agent_config
+
+
+def get_workspace_dir() -> Path:
+    """Writable workspace for the agent; created on demand.
+
+    Everything the agent is allowed to touch lives here, so this path is
+    always valid even when the config points at a not-yet-existing folder.
+    """
+    cfg = get_agent_config()
+    paths = list(cfg.sandbox.allowed_paths) or [str(Path.home() / ".jarvis" / "workspace")]
+    workspace = Path(paths[0]).expanduser()
+    workspace.mkdir(parents=True, exist_ok=True)
+    return workspace

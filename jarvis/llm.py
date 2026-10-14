@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
@@ -19,6 +20,31 @@ from jarvis.events import Event, Events, get_event_bus
 class Message:
     role: str  # system, user, assistant
     content: str
+
+
+def extract_json(text: str | None) -> dict | list | None:
+    """Pull the first valid JSON value out of raw model output.
+
+    Small local models routinely wrap JSON in markdown fences, add a leading
+    sentence, or append stray braces. A greedy regex `\\{.*\\}` blows up on
+    those, so we scan for the first character that starts a JSON value and let
+    ``raw_decode`` stop at the matching end.
+    """
+    if not text:
+        return None
+
+    cleaned = re.sub(r"```(?:json)?", "", text)
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(cleaned):
+        if char not in "{[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(cleaned, index)
+        except ValueError:
+            continue
+        if isinstance(value, (dict, list)):
+            return value
+    return None
 
 
 class LLMProvider(ABC):
@@ -42,8 +68,32 @@ class LLMProvider(ABC):
             self._client_loop = loop
         return self._client
 
+    @staticmethod
+    def _apply_options(payload: dict, options: Optional[dict]) -> dict:
+        """Map generic generation options onto an OpenAI/Anthropic payload."""
+        if not options:
+            return payload
+        mapping = {"num_predict": "max_tokens", "temperature": "temperature",
+                   "top_p": "top_p", "stop": "stop"}
+        for key, value in options.items():
+            target = mapping.get(key)
+            if target and value is not None:
+                payload[target] = value
+        return payload
+
     @abstractmethod
-    async def complete(self, messages: list[Message], stream: bool = False) -> str | AsyncIterator[str]:
+    async def complete(
+        self,
+        messages: list[Message],
+        stream: bool = False,
+        options: Optional[dict] = None,
+    ) -> str | AsyncIterator[str]:
+        """Complete a chat request.
+
+        ``options`` carries provider-specific generation overrides (for
+        Ollama: ``num_predict``, ``temperature``, ``top_p``...). Agent loops
+        rely on it to keep tool decisions short and deterministic.
+        """
         pass
 
     async def close(self) -> None:
@@ -62,25 +112,46 @@ class LLMProvider(ABC):
 class OllamaProvider(LLMProvider):
     """Ollama local LLM provider."""
 
-    def __init__(self, base_url: str, model: str, temperature: float = 0.7, max_tokens: int = 4096) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        num_ctx: int = 2048,
+        keep_alive: str = "30m",
+    ) -> None:
         super().__init__()
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.num_ctx = num_ctx
+        self.keep_alive = keep_alive
 
-    async def complete(self, messages: list[Message], stream: bool = False) -> str | AsyncIterator[str]:
+    async def complete(
+        self,
+        messages: list[Message],
+        stream: bool = False,
+        options: Optional[dict] = None,
+    ) -> str | AsyncIterator[str]:
         client = await self._client_for(60.0)
+
+        merged = {
+            "temperature": self.temperature,
+            "num_predict": self.max_tokens,
+            "num_ctx": self.num_ctx,
+        }
+        if options:
+            merged.update({k: v for k, v in options.items() if v is not None})
 
         payload = {
             "model": self.model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
             "stream": stream,
             "think": False,  # Disable thinking for faster responses (nemotron, etc.)
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.max_tokens,
-            },
+            "keep_alive": self.keep_alive,
+            "options": merged,
         }
 
         if stream:
@@ -121,7 +192,12 @@ class OpenAIProvider(LLMProvider):
             headers={"Authorization": f"Bearer {self.api_key}"},
         )
 
-    async def complete(self, messages: list[Message], stream: bool = False) -> str | AsyncIterator[str]:
+    async def complete(
+        self,
+        messages: list[Message],
+        stream: bool = False,
+        options: Optional[dict] = None,
+    ) -> str | AsyncIterator[str]:
         client = await self._openai_client()
 
         payload = {
@@ -131,6 +207,7 @@ class OpenAIProvider(LLMProvider):
             "max_tokens": self.max_tokens,
             "stream": stream,
         }
+        payload = self._apply_options(payload, options)
 
         if stream:
             return self._stream_complete(client, payload)
@@ -178,7 +255,12 @@ class AnthropicProvider(LLMProvider):
             },
         )
 
-    async def complete(self, messages: list[Message], stream: bool = False) -> str | AsyncIterator[str]:
+    async def complete(
+        self,
+        messages: list[Message],
+        stream: bool = False,
+        options: Optional[dict] = None,
+    ) -> str | AsyncIterator[str]:
         client = await self._anthropic_client()
 
         # Convert messages: system prompt separate, rest as user/assistant
@@ -197,6 +279,7 @@ class AnthropicProvider(LLMProvider):
             "max_tokens": self.max_tokens,
             "stream": stream,
         }
+        payload = self._apply_options(payload, options)
         if system:
             payload["system"] = system
 
@@ -262,7 +345,14 @@ Be proactive but not verbose. Use a professional yet friendly tone."""
 
     def _create_provider(self, name: str, config) -> Optional[LLMProvider]:
         if name == "ollama":
-            return OllamaProvider(config.base_url, config.model, config.temperature, config.max_tokens)
+            return OllamaProvider(
+                config.base_url,
+                config.model,
+                config.temperature,
+                config.max_tokens,
+                config.num_ctx,
+                config.keep_alive,
+            )
         elif name == "openai":
             if not config.api_key:
                 return None
@@ -302,6 +392,7 @@ Be proactive but not verbose. Use a professional yet friendly tone."""
         system_prompt: Optional[str] = None,
         stream: bool = False,
         history: Optional[list[Message]] = None,
+        options: Optional[dict] = None,
     ) -> str | AsyncIterator[str]:
         """Complete a user request.
 
@@ -311,6 +402,8 @@ Be proactive but not verbose. Use a professional yet friendly tone."""
             system_prompt: System prompt override.
             stream: Stream the response.
             history: Prior turns (user/assistant) for conversational context.
+            options: Generation overrides (Ollama: ``num_predict``,
+                ``temperature``...). Used by the agent to cap output length.
         """
         # Lazy initialize providers if not yet loaded
         if not self._providers:
@@ -328,7 +421,7 @@ Be proactive but not verbose. Use a professional yet friendly tone."""
                     messages.append(Message(role=m.role, content=m.content))
         messages.append(Message(role="user", content=user_input))
 
-        return await llm_provider.complete(messages, stream=stream)
+        return await llm_provider.complete(messages, stream=stream, options=options)
 
     async def process_event(self, event: Event) -> None:
         """Handle LLM_REQUEST event."""

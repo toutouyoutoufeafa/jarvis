@@ -8,39 +8,43 @@ from pathlib import Path
 from typing import Any
 
 from jarvis.agent.tools import tool, get_tool_registry
-from jarvis.agent.config import get_agent_config
+from jarvis.agent.config import get_agent_config, get_workspace_dir
 from jarvis.config import get_config
 
 
 def _resolve_path(path: str) -> Path:
-    """Resolve and validate path against allowed paths."""
-    config = get_config()
-    target = Path(path).expanduser().resolve()
+    """Resolve and validate a path against the allowed roots.
 
-    # Check against allowed paths
-    allowed = False
-    for allowed_path in config.system_control.allowed_paths:
+    Relative paths are anchored in the agent workspace rather than the process
+    CWD, so a bare ``hello.py`` lands somewhere writable instead of being
+    rejected outright.
+    """
+    raw = Path(path).expanduser()
+    if not raw.is_absolute():
+        raw = get_workspace_dir() / raw
+    target = raw.resolve()
+
+    allowed_roots = [
+        Path(p).expanduser().resolve()
+        for p in (
+            list(get_config().system_control.allowed_paths)
+            + list(get_agent_config().sandbox.allowed_paths)
+        )
+        if p
+    ]
+
+    for root in allowed_roots:
         try:
-            target.relative_to(Path(allowed_path).expanduser().resolve())
-            allowed = True
-            break
+            target.relative_to(root)
+            return target
         except ValueError:
-            pass
+            continue
 
-    # Also check agent workspace
-    agent_config = get_agent_config()
-    for allowed_path in agent_config.sandbox.allowed_paths:
-        try:
-            target.relative_to(Path(allowed_path).expanduser().resolve())
-            allowed = True
-            break
-        except ValueError:
-            pass
-
-    if not allowed:
-        raise PermissionError(f"Path not in allowed paths: {target}")
-
-    return target
+    raise PermissionError(
+        f"Path not allowed: {target}. "
+        f"Allowed roots: {', '.join(str(r) for r in allowed_roots) or '(none)'}. "
+        f"Write a relative path to work inside the workspace: {get_workspace_dir()}"
+    )
 
 
 @tool("fs_read", "Read file contents")

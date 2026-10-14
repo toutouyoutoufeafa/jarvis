@@ -43,6 +43,15 @@ class LLMProviderConfig(BaseSettings):
     model: str
     temperature: float = 0.7
     max_tokens: int = 4096
+    # KV-cache window. Prompt evaluation speed is independent of this
+    # (measured 4096 vs 1024: same latency), but the cache itself is
+    # hundreds of MB per loaded model -- and this box has two plus 16 GB
+    # of RAM total, so anything beyond what we actually prompt is waste.
+    num_ctx: int = 2048
+    # How long Ollama keeps the weights resident after the last request.
+    # Its default (5 min) silently adds ~15-25s of model reload to the
+    # first call after any pause -- worth knowing on a CPU-only machine.
+    keep_alive: str = "30m"
 
 
 class LLMConfig(BaseSettings):
@@ -60,7 +69,7 @@ class SystemControlConfig(BaseSettings):
 
 class PluginsConfig(BaseSettings):
     enabled: bool = True
-    directories: list[str] = Field(default_factory=list)
+    directories: list[str] = Field(default_factory=lambda: ["plugins", "~/.jarvis/plugins"])
 
 
 class LoggingConfig(BaseSettings):
@@ -127,12 +136,42 @@ class Config(BaseSettings):
 
 # Global config instance
 _config: Config | None = None
+_config_path: Path | None = None
+
+# Repository/ install root (parent of the `jarvis` package)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def find_config_file() -> Path | None:
+    """Locate config.yaml: env override > CWD > user home > project root."""
+    candidates = [
+        os.environ.get("JARVIS_CONFIG"),
+        Path.cwd() / "config.yaml",
+        Path.home() / ".jarvis" / "config.yaml",
+        PROJECT_ROOT / "config.yaml",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if path.is_file():
+            return path
+    return None
+
+
+def get_config_dir() -> Path:
+    """Directory holding the active config (used to resolve relative paths)."""
+    return _config_path.parent if _config_path else PROJECT_ROOT
 
 
 def get_config() -> Config:
-    global _config
+    global _config, _config_path
     if _config is None:
-        _config = Config.from_yaml("config.yaml")
+        _config_path = find_config_file()
+        if _config_path is None:
+            _config = Config()
+        else:
+            _config = Config.from_yaml(_config_path)
     return _config
 
 

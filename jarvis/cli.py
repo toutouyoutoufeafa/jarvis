@@ -162,8 +162,10 @@ ui:
 
 @app.command()
 def plugins_list() -> None:
-    """List loaded plugins."""
+    """Discover, load and list plugins."""
     pm = get_plugin_manager()
+    if not pm.plugins:
+        pm.load_all()
     plugins = pm.list_plugins()
 
     if not plugins:

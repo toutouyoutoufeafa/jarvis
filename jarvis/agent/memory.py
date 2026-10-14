@@ -270,27 +270,24 @@ class MemoryManager:
         return await self.ltm.search(query, limit, filter_metadata)
 
     async def get_context(self, query: str, max_tokens: int = 3000) -> str:
-        """Get relevant context from both STM and LTM."""
-        # Search LTM
-        ltm_results = await self.search_ltm(query, limit=5)
+        """Get relevant context from both STM and LTM.
 
-        # Combine with recent STM
-        context_parts = []
+        Every entry is truncated individually: joining ten full STM records
+        easily reaches thousands of tokens, and on local CPU hardware prompt
+        evaluation dominates latency (~38 tok/s measured).
+        """
+        entry_chars = max(120, (max_tokens * 4) // 8)
 
-        # Add relevant LTM
-        for entry in ltm_results:
-            context_parts.append(f"[LTM] {entry.content}")
+        context_parts: list[str] = []
+        for entry in await self.search_ltm(query, limit=4):
+            context_parts.append(f"[LTM] {entry.content[:entry_chars]}")
+        for entry in self.stm[-8:]:
+            context_parts.append(f"[STM] {entry.content[:entry_chars]}")
 
-        # Add recent STM (last 10)
-        for entry in self.stm[-10:]:
-            context_parts.append(f"[STM] {entry.content}")
-
-        context = "\n\n".join(context_parts)
-
-        # Truncate to max tokens
-        if len(context) > max_tokens * 4:
-            context = context[:max_tokens * 4] + "\n...[truncated]"
-
+        context = "\n".join(p for p in context_parts if p)
+        limit = max_tokens * 4
+        if len(context) > limit:
+            context = context[:limit] + "\n...[truncated]"
         return context
 
     def get_stm_summary(self) -> str:

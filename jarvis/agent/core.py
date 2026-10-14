@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,11 +11,11 @@ from typing import Any, Optional
 
 from loguru import logger
 
-from jarvis.agent.config import get_agent_config
+from jarvis.agent.config import get_agent_config, get_workspace_dir
 from jarvis.agent.memory import get_memory_manager, MemoryEntry
 from jarvis.agent.planner import get_planner, get_executor, Plan, PlanStep
 from jarvis.agent.tools import get_tool_registry
-from jarvis.llm import get_llm_engine, Message
+from jarvis.llm import get_llm_engine, Message, extract_json
 from jarvis.events import Event, Events, get_event_bus
 
 
@@ -42,6 +41,54 @@ class AgentTask:
     error: str | None = None
     plan: Plan | None = None
     iterations: int = 0
+    # Anti-hallucination bookkeeping: surfaced back into the think prompt so
+    # the model cannot claim a tool call succeeded when it demonstrably failed.
+    last_observation: str | None = None
+    tool_failures: int = 0
+    answer_rejected: int = 0
+    # Anti-deadlock: small models happily re-run the same successful call
+    # forever instead of concluding.
+    last_action_key: str | None = None
+    repeats: int = 0
+    tools_used: int = 0
+
+
+# Small models routinely name a required argument differently from the schema.
+# Map canonical parameter -> acceptable synonyms found in model output.
+_TOOL_ARG_ALIASES: dict[str, tuple[str, ...]] = {
+    "content": ("data", "text", "contents", "body", "file_content", "value"),
+    "path": ("file", "filename", "filepath", "file_path", "target"),
+    "dest_path": ("destination", "output", "out"),
+    "dst": ("dest", "destination", "target"),
+    "command": ("cmd", "cmdline", "shell", "input"),
+    "code": ("source", "script", "python", "program"),
+    "query": ("q", "search", "question", "prompt"),
+    "url": ("uri", "link", "site"),
+    "message": ("msg", "text"),
+    "repo": ("repository", "git_url"),
+    "branch": ("name", "ref"),
+}
+
+_ACTION_TYPES = {"tool", "answer", "plan", "execute", "wait"}
+
+# A tool decision is one short JSON object. Capping generation keeps a small
+# local model from rambling: measured ~45s -> ~5s per decision on CPU.
+THINK_OPTIONS = {"num_predict": 96, "temperature": 0.1}
+
+# Tools shown with a full signature; the rest are listed by name only. Keeps
+# the decision prompt near 400 tokens, which is ~10s of prompt evaluation.
+_DETAILED_TOOLS = {
+    "fs_read", "fs_write", "fs_list", "fs_mkdir", "fs_exists",
+    "fs_copy", "fs_move",
+    "shell_exec", "python_exec",
+    "web_search", "web_fetch",
+}
+
+
+def _admits_failure(text: str) -> bool:
+    """True when the model is honestly reporting that it could not succeed."""
+    head = (text or "").strip().lower()[:40]
+    return head.startswith(("failed", "erreur", "error", "échec", "echec", "impossible"))
 
 
 class AgentCore:
@@ -111,7 +158,7 @@ class AgentCore:
 
                 # Think: decide next action
                 task.state = AgentState.THINKING
-                action = await self._think(task)
+                action = self._normalize_action(await self._think(task))
 
                 if action.get("type") == "plan":
                     task.state = AgentState.PLANNING
@@ -125,15 +172,107 @@ class AgentCore:
                         await self._emit_task_update(task)
 
                 elif action.get("type") == "tool":
-                    # Direct tool use
-                    result = await self.tools.execute(action["tool"], **action.get("args", {}))
+                    # Direct tool use. Failures are fed back as observations so
+                    # the agent can correct itself (e.g. wrong tool name) instead
+                    # of aborting the whole task.
+                    tool_name = str(action.get("tool", ""))
+                    tool_args = action.get("args", {})
+                    action_key = json.dumps(
+                        {"tool": tool_name, "args": tool_args}, sort_keys=True, default=str
+                    )
+
+                    # Deadlock breaker: the same successful call repeated means
+                    # the model is spinning rather than progressing.
+                    if action_key == task.last_action_key and not task.tool_failures:
+                        task.repeats += 1
+                        if task.repeats >= 2:
+                            task.result = (
+                                "Objectif deja realise (boucle interrompue). "
+                                f"Derniere observation: {task.last_observation}"
+                            )
+                            task.state = AgentState.DONE
+                            break
+                        observation = (
+                            "ALREADY DONE: this exact call already returned OK. "
+                            'If the goal is satisfied reply with {"type":"answer","content":"..."} '
+                            "now, otherwise do something different."
+                        )
+                        task.last_observation = observation
+                        self.memory.add_stm(
+                            observation, metadata={"task_id": task.id, "type": "nudge"}
+                        )
+                        continue
+
+                    task.repeats = 0
+                    task.last_action_key = action_key
+                    task.tools_used += 1
+
+                    try:
+                        result = await self.tools.execute(tool_name, **tool_args)
+                        observation = f"OK ({tool_name}): {result}"
+                        task.tool_failures = 0
+                    except Exception as e:
+                        if tool_name not in self.tools.list_names():
+                            hint = (
+                                f"Unknown tool '{tool_name}'. "
+                                f"Use ONLY these: {', '.join(sorted(self.tools.list_names()))}"
+                            )
+                        else:
+                            hint = f"Tool '{tool_name}' failed: {e}"
+                        observation = f"ERROR: {hint}"
+                        task.tool_failures += 1
+                        logger.warning(f"Tool call rejected: {hint}")
+
+                    task.last_observation = observation
                     self.memory.add_stm(
-                        f"Tool {action['tool']} result: {result}",
-                        metadata={"task_id": task.id, "tool": action["tool"]},
+                        observation,
+                        metadata={"task_id": task.id, "tool": tool_name, "type": "observation"},
                     )
 
                 elif action.get("type") == "answer":
-                    task.result = action.get("content")
+                    content = str(action.get("content") or "")
+                    # A conclusion reached without touching a single tool is
+                    # almost always a shortcut: the model declares success on
+                    # the goal's wording alone. Ask once, then accept.
+                    if not task.tools_used and task.answer_rejected < 1:
+                        task.answer_rejected += 1
+                        refusal = (
+                            "REFUSED: you answered without calling any tool, so "
+                            f"nothing was actually done for: {task.goal!r}. "
+                            "Use a tool to perform the action, then answer. If the "
+                            "goal genuinely needs no tool, answer again to say so."
+                        )
+                        task.last_observation = refusal
+                        self.memory.add_stm(
+                            refusal, metadata={"task_id": task.id, "type": "refusal"}
+                        )
+                        logger.warning(f"Rejected tool-free answer: {content[:120]}")
+                        continue
+
+                    # Refuse a "success" report issued while tool calls are
+                    # still failing; give the model two attempts to actually
+                    # perform the action before accepting its conclusion.
+                    if (
+                        task.tool_failures
+                        and task.answer_rejected < 2
+                        and not _admits_failure(content)
+                    ):
+                        task.answer_rejected += 1
+                        refusal = (
+                            "REFUSED: you reported a result while the last tool "
+                            f"call failed. Last observation: {task.last_observation}. "
+                            "Retry with a valid tool name/arguments (see TOOLS list "
+                            "and WORKSPACE above), or answer with 'FAILED: <reason>'."
+                        )
+                        task.last_observation = refusal
+                        self.memory.add_stm(
+                            refusal,
+                            metadata={"task_id": task.id, "type": "refusal"},
+                        )
+                        logger.warning(f"Rejected premature answer: {content[:120]}")
+                        continue
+
+                    task.result = content
                     task.state = AgentState.DONE
                     break
 
@@ -176,13 +315,12 @@ class AgentCore:
         if task.context:
             parts.append(f"Context: {json.dumps(task.context)}")
 
-        # Add memory context
-        mem_context = await self.memory.get_context(task.goal)
+        # Bounded memory window: this is the only part of the prompt that
+        # changes between iterations, so keep it small enough to re-evaluate
+        # quickly (~38 tok/s on CPU).
+        mem_context = await self.memory.get_context(task.goal, max_tokens=250)
         if mem_context:
             parts.append(f"Memory:\n{mem_context}")
-
-        # Add STM summary
-        parts.append(self.memory.get_stm_summary())
 
         # Add plan status
         if task.plan:
@@ -193,37 +331,162 @@ class AgentCore:
 
         return "\n\n".join(parts)
 
+    def _normalize_action(self, action: dict) -> dict:
+        """Coerce whatever the model emitted into the canonical action shape.
+
+        Small models frequently reply ``{"type":"fs_write","args":{...}}``
+        instead of ``{"type":"tool","tool":"fs_write",...}``, or wrap the tool
+        in ``execute``. Silently dropping those would stall the loop, so we
+        translate them rather than reject them.
+        """
+        if not isinstance(action, dict):
+            return {"type": "wait", "duration": 1, "reasoning": "Non-JSON action"}
+
+        atype = str(action.get("type") or "").strip()
+        known = self.tools.list_names()
+
+        # {"type":"fs_write", "args":{...}} -- type IS the tool name
+        if atype and atype not in _ACTION_TYPES and atype in known:
+            return self._as_tool_action(atype, action)
+
+        if atype in ("tool", "call", "function", "action"):
+            tool = action.get("tool") or action.get("name") or action.get("function")
+            if isinstance(tool, str) and tool:
+                return self._as_tool_action(tool, action)
+
+        if atype == "execute":
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            if isinstance(action.get("tool"), str):
+                return self._as_tool_action(action["tool"], action)
+            if isinstance(args.get("tool"), str):
+                inner = {k: v for k, v in args.items() if k not in ("tool", "args")}
+                inner.update(args.get("args") or {})
+                return self._as_tool_action(args["tool"], {"args": inner})
+            # Bare payload: infer the tool from the argument name.
+            for key, tool_name in (
+                ("cmd", "shell_exec"),
+                ("command", "shell_exec"),
+                ("code", "python_exec"),
+                ("script", "python_exec"),
+            ):
+                if key in args:
+                    logger.info(f"execute payload mapped to {tool_name}")
+                    return self._as_tool_action(tool_name, {"args": args})
+            logger.warning(f"Unusable execute action: {action}")
+            return {"type": "wait", "duration": 1, "reasoning": "Unusable execute action"}
+
+        if atype in ("final", "response", "result", "done") and "content" in action:
+            return {"type": "answer", "content": action.get("content")}
+
+        if not atype:
+            if "tool" in action:
+                return self._as_tool_action(str(action["tool"]), action)
+            if "content" in action:
+                return {"type": "answer", "content": action.get("content")}
+            logger.warning(f"Action without type: {action}")
+            return {"type": "wait", "duration": 1, "reasoning": "Action without type"}
+
+        if atype not in _ACTION_TYPES:
+            logger.warning(f"Unknown action type '{atype}', waiting")
+            return {"type": "wait", "duration": 1, "reasoning": f"Unknown type {atype}"}
+
+        if atype == "tool":
+            tool = action.get("tool")
+            if not isinstance(tool, str) or not tool:
+                logger.warning(f"tool action without tool name: {action}")
+                return {"type": "wait", "duration": 1, "reasoning": "Missing tool name"}
+            return self._as_tool_action(tool, action)
+
+        if atype == "answer" and "content" not in action:
+            for key in ("text", "result", "message"):
+                if key in action:
+                    return {"type": "answer", "content": action.get(key)}
+
+        return action
+
+    def _as_tool_action(self, tool_name: str, action: dict) -> dict:
+        raw = action.get("args")
+        if not isinstance(raw, dict):
+            reserved = {"type", "tool", "name", "function", "args", "reasoning", "content"}
+            raw = {k: v for k, v in action.items() if k not in reserved}
+        return {"type": "tool", "tool": tool_name, "args": self._coerce_args(tool_name, raw)}
+
+    def _coerce_args(self, tool_name: str, args: dict) -> dict:
+        """Rename aliased keys so required parameters are actually supplied."""
+        tool = self.tools.get(tool_name)
+        if tool is None or not args:
+            return args
+
+        coerced = dict(args)
+        for param in tool.get_schema().parameters:
+            if not param.required or param.name in coerced:
+                continue
+            for alias in _TOOL_ARG_ALIASES.get(param.name, ()):
+                if alias in coerced:
+                    coerced[param.name] = coerced.pop(alias)
+                    break
+        return coerced
+
+    def _agent_system_prompt(self) -> str:
+        """Static half of the decision prompt.
+
+        Prompt evaluation costs ~44 tok/s on this CPU-only machine, so token
+        count is latency. Only tools whose argument names are not obvious get
+        a signature; the remaining ones are listed by name alone.
+        """
+        workspace = get_workspace_dir()
+        catalogue = self.tools.describe_all(full=_DETAILED_TOOLS)
+        return f"""Tu es JARVIS, un agent autonome. Reponds UNIQUEMENT par un objet JSON.
+
+WORKSPACE (seul endroit ou creer des fichiers): {workspace}
+
+OUTILS ({len(self.tools.list_names())} disponibles):
+{catalogue}
+
+Reponds par EXACTEMENT UN objet JSON:
+{{"type":"tool","tool":"fs_write","args":{{"path":"<fichier>","content":"<texte>"}}}}
+{{"type":"answer","content":"<resultat>"}}
+{{"type":"plan"}}
+
+Regles:
+- "type" vaut TOUJOURS "tool" pour un appel d'outil; le nom va dans "tool".
+- Les cles de "args" doivent correspondre a la signature de l'outil.
+- Chemins relatifs = dans le workspace.
+- Ne declare un succes que si la derniere observation commence par OK.
+- N'answer qu'apres avoir reellement execute l'action demandee avec un outil.
+- Des que l'objectif est atteint, reponds answer au lieu d'appeler d'autres outils.
+JSON:"""
+
     async def _think(self, task: AgentTask) -> dict:
         """Decide next action using LLM."""
         context = await self._build_context(task)
 
-        # Lightweight tool list: only names, not full schemas (small-model friendly)
-        tool_names = self.tools.list_names()
-        tools_desc = ", ".join(tool_names)
-
-        prompt = f"""You are JARVIS, an autonomous agent.
-GOAL: {task.goal}
-
-{context}
-
-TOOLS: {tools_desc}
-
-Choose ONE action. Reply with ONLY JSON:
-{{"type":"tool","tool":"tool_name","args":{{}}}} or
-{{"type":"answer","content":"final result"}} or
-{{"type":"plan"}} or
-{{"type":"execute"}}
-
-JSON:"""
+        # Make a failed last step impossible to ignore: small models happily
+        # report "done" right after an error unless it is spelled out.
+        if task.tool_failures:
+            context += (
+                f"\n\nDERNIERE ETAPE EN ECHEC ({task.tool_failures} echec(s) consecutif(s)):\n"
+                f"{task.last_observation}\n"
+                "Ne declare PAS de succes. Corrige le nom de l'outil ou ses arguments, "
+                "ou reponds 'FAILED: <raison>'."
+            )
+        elif task.last_observation:
+            context += f"\n\nRESULTAT DE LA DERNIERE ETAPE:\n{task.last_observation}"
 
         try:
-            response = await self.llm.complete(prompt)
+            response = await self.llm.complete(
+                context,
+                system_prompt=self._agent_system_prompt(),
+                options=THINK_OPTIONS,
+            )
             self._llm_failures = 0  # Reset on success
             logger.debug(f"Agent think: {response[:300]}...")
 
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
+            action = extract_json(response)
+            if isinstance(action, dict) and action:
+                # `type` may be missing; _normalize_action handles that shape.
+                return action
+            logger.warning(f"No usable action in think response: {response[:200]}")
         except Exception as e:
             self._llm_failures += 1
             logger.error(f"Think failed ({self._llm_failures} consecutive): {e}")

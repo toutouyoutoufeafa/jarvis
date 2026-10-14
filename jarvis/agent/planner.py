@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
 
 from jarvis.agent.config import get_agent_config
-from jarvis.llm import get_llm_engine, Message
+from jarvis.llm import get_llm_engine, Message, extract_json
 from jarvis.agent.tools import get_tool_registry
+
+
+# Plans are short JSON; a small model writing 400 tokens of plan costs a minute.
+PLAN_OPTIONS = {"num_predict": 384, "temperature": 0.2}
 
 
 @dataclass
@@ -58,69 +61,72 @@ class Planner:
         self.tools = get_tool_registry()
 
     def _build_planning_prompt(self, goal: str, context: str = "") -> str:
-        tool_schemas = self.tools.get_openai_schemas()
-        tools_desc = json.dumps(tool_schemas, indent=2)
+        # Compact signatures instead of full JSON schemas: the latter bloat the
+        # prompt past what small local models can handle reliably.
+        from jarvis.agent.config import get_workspace_dir
+        from jarvis.agent.core import _DETAILED_TOOLS
 
-        return f"""You are a planning agent. Decompose the goal into a sequence of steps using available tools.
+        tools_desc = self.tools.describe_all(full=_DETAILED_TOOLS)
+
+        return f"""You are a planning agent. Decompose the goal into steps using the available tools.
 
 GOAL: {goal}
 
 CONTEXT:
 {context}
 
+WORKSPACE (only place files may be created): {get_workspace_dir()}
+
 AVAILABLE TOOLS:
 {tools_desc}
 
-Return a JSON plan with this structure:
-{{
-  "steps": [
-    {{
-      "id": "step_1",
-      "description": "What this step does",
-      "tool": "tool_name",  // or null for reasoning-only step
-      "args": {{"arg1": "value"}},  // arguments for the tool
-      "depends_on": []  // list of step IDs this depends on
-    }}
-  ]
-}}
+Return a JSON plan:
+{{"steps": [
+  {{"id": "step_1", "description": "what it does", "tool": "tool_name", "args": {{}}, "depends_on": []}}
+]}}
 
 Rules:
-- Use ONLY tools from the available list
-- Each step should be atomic and verifiable
-- Include depends_on for ordering
+- Use ONLY tool names listed above ("tool": null means reasoning-only)
+- Each step must be atomic
 - Max {self.config.planner.max_steps} steps
-- If goal needs reasoning without tools, use tool: null
-- Prefer parallel steps when possible (no depends_on)
+- Reply with ONLY the JSON
 
 JSON Plan:"""
+
+    def _parse_plan(self, response: str, goal: str) -> Plan:
+        """Parse a model plan, dropping steps that reference unknown tools."""
+        data = extract_json(response)
+        if not isinstance(data, dict):
+            raise ValueError("No JSON found in planner response")
+
+        known_tools = set(self.tools.list_names())
+        steps = []
+        for i, step_data in enumerate(data.get("steps", [])):
+            tool_name = step_data.get("tool")
+            if tool_name and tool_name not in known_tools:
+                logger.warning(f"Planner invented tool '{tool_name}', dropping it")
+                tool_name = None
+            steps.append(PlanStep(
+                id=step_data.get("id", f"step_{i+1}"),
+                description=step_data.get("description", ""),
+                tool=tool_name,
+                args=step_data.get("args", {}),
+                depends_on=step_data.get("depends_on", []),
+            ))
+
+        if not steps:
+            raise ValueError("Planner returned no usable steps")
+
+        return Plan(goal=goal, steps=steps)
 
     async def create_plan(self, goal: str, context: str = "") -> Plan:
         """Create execution plan for a goal."""
         prompt = self._build_planning_prompt(goal, context)
 
         try:
-            response = await self.llm.complete(prompt)
+            response = await self.llm.complete(prompt, options=PLAN_OPTIONS)
             logger.debug(f"Planner response: {response[:500]}...")
-
-            # Extract JSON
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not json_match:
-                raise ValueError("No JSON found in planner response")
-
-            data = json.loads(json_match.group())
-            steps = []
-
-            for i, step_data in enumerate(data.get("steps", [])):
-                step = PlanStep(
-                    id=step_data.get("id", f"step_{i+1}"),
-                    description=step_data.get("description", ""),
-                    tool=step_data.get("tool"),
-                    args=step_data.get("args", {}),
-                    depends_on=step_data.get("depends_on", []),
-                )
-                steps.append(step)
-
-            return Plan(goal=goal, steps=steps)
+            return self._parse_plan(response, goal)
 
         except Exception as e:
             logger.error(f"Planning failed: {e}")
@@ -148,19 +154,7 @@ Return improved JSON plan with same structure."""
 
         try:
             response = await self.llm.complete(prompt)
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                steps = []
-                for i, step_data in enumerate(data.get("steps", [])):
-                    steps.append(PlanStep(
-                        id=step_data.get("id", f"step_{i+1}"),
-                        description=step_data.get("description", ""),
-                        tool=step_data.get("tool"),
-                        args=step_data.get("args", {}),
-                        depends_on=step_data.get("depends_on", []),
-                    ))
-                plan.steps = steps
+            plan = self._parse_plan(response, plan.goal)
         except Exception as e:
             logger.error(f"Plan refinement failed: {e}")
 

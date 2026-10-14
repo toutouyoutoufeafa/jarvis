@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from jarvis.agent.tools import tool, get_tool_registry
-from jarvis.agent.config import get_agent_config
+from jarvis.agent.config import get_agent_config, get_workspace_dir
 
 
 @tool("shell_exec", "Execute shell command")
@@ -28,8 +30,9 @@ async def shell_exec(
     if env:
         full_env.update(env)
 
-    # Resolve cwd
-    work_dir = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
+    # Resolve cwd. Default to the workspace: the process CWD (e.g. the project
+    # checkout) is usually outside the sandbox's allowed paths.
+    work_dir = Path(cwd).expanduser().resolve() if cwd else get_workspace_dir()
 
     # Validate cwd against allowed paths
     allowed = False

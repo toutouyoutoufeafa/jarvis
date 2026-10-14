@@ -15,7 +15,7 @@ from typing import Any
 import docker
 from loguru import logger
 
-from jarvis.agent.config import get_agent_config
+from jarvis.agent.config import get_agent_config, get_workspace_dir
 
 
 @dataclass
@@ -55,15 +55,6 @@ class Sandbox:
     async def install_package(self, package: str, timeout: int = 60) -> dict:
         raise NotImplementedError
 
-
-class SubprocessSandbox(Sandbox):
-    """Subprocess-based sandbox (current process isolation)."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._session_counter = 0
-        self._repl_globals: dict[str, dict] = {}
-
     def _prepare_code(
         self,
         code: str,
@@ -94,6 +85,15 @@ class SubprocessSandbox(Sandbox):
 
         return "\n".join(lines)
 
+
+class SubprocessSandbox(Sandbox):
+    """Subprocess-based sandbox (current process isolation)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._session_counter = 0
+        self._repl_globals: dict[str, dict] = {}
+
     async def run_python(
         self,
         code: str,
@@ -115,8 +115,7 @@ class SubprocessSandbox(Sandbox):
             env["PYTHONUNBUFFERED"] = "1"
 
             # Ensure workspace directory exists
-            workspace = Path.home() / "jarvis_workspace"
-            workspace.mkdir(parents=True, exist_ok=True)
+            workspace = get_workspace_dir()
 
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, str(script_path),

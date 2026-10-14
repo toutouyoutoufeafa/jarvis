@@ -11,7 +11,7 @@ from typing import Any
 from loguru import logger
 from pydantic import BaseModel
 
-from jarvis.config import get_config
+from jarvis.config import get_config, get_config_dir
 from jarvis.events import EventBus, get_event_bus
 
 
@@ -90,19 +90,30 @@ class PluginManager:
         """Find plugin modules in configured directories."""
         config = get_config()
         dirs = directories or config.plugins.directories
+        # Relative entries are resolved against the config directory (falling
+        # back to the project root), not the CWD, so `jarvis` works anywhere.
+        base_dir = get_config_dir()
         plugin_files = []
+        seen: set[Path] = set()
 
         for dir_str in dirs:
             path = Path(dir_str).expanduser()
+            if not path.is_absolute():
+                path = base_dir / path
             if not path.exists():
-                logger.warning(f"Plugin directory not found: {path}")
+                # `~/.jarvis/plugins` is optional user-extended storage
+                logger.debug(f"Plugin directory not found: {path}")
                 continue
 
-            for py_file in path.rglob("*.py"):
+            for py_file in sorted(path.rglob("*.py")):
                 if py_file.name.startswith("_"):
                     continue
                 if py_file.name == "plugin.py" or py_file.stem.endswith("_plugin"):
-                    plugin_files.append(py_file)
+                    resolved = py_file.resolve()
+                    if resolved in seen:
+                        continue
+                    seen.add(resolved)
+                    plugin_files.append(resolved)
 
         return plugin_files
 

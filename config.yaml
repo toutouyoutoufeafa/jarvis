@@ -65,9 +65,9 @@ system_control:
     - "cmd"
     - "powershell"
   allowed_paths:                # Chemins autorisés pour fichiers
-    - "C:\\Users\\${USERNAME}\\Documents"
-    - "C:\\Users\\${USERNAME}\\Desktop"
-    - "D:\\Projects"
+    - "~/.jarvis/workspace"
+    - "~/Documents"
+    - "~/Desktop"
 
 plugins:
   enabled: true
@@ -96,8 +96,7 @@ agent:
     cpu_limit: 1.0
     network_enabled: false
     allowed_paths:
-      - "C:\\Users\\${USERNAME}\\jarvis_workspace"
-      - "/tmp/jarvis"
+      - "~/.jarvis/workspace"      # Espace de travail de l'agent (cree automatiquement)
 
   memory:
     enabled: true
