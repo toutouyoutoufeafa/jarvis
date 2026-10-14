@@ -24,32 +24,53 @@ class Message:
 class LLMProvider(ABC):
     """Base class for LLM providers."""
 
+    def __init__(self) -> None:
+        self._client: Optional[httpx.AsyncClient] = None
+        self._client_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    async def _client_for(self, timeout: float = 60.0, **kwargs) -> httpx.AsyncClient:
+        """Return an httpx client bound to the *current* event loop.
+
+        Streamlit (and ``run_async``) create a fresh event loop per request.
+        Reusing a client created in an earlier, now-closed loop raises
+        ``RuntimeError: Event loop is closed``, so the client is rebuilt
+        whenever the running loop changes.
+        """
+        loop = asyncio.get_running_loop()
+        if self._client is None or self._client_loop is not loop:
+            self._client = httpx.AsyncClient(timeout=timeout, **kwargs)
+            self._client_loop = loop
+        return self._client
+
     @abstractmethod
     async def complete(self, messages: list[Message], stream: bool = False) -> str | AsyncIterator[str]:
         pass
 
-    @abstractmethod
     async def close(self) -> None:
-        pass
+        if self._client is None:
+            return
+        client, loop = self._client, self._client_loop
+        self._client, self._client_loop = None, None
+        if loop is None or loop.is_closed():
+            return  # nothing sane to await against a dead loop
+        try:
+            await client.aclose()
+        except RuntimeError:
+            pass
 
 
 class OllamaProvider(LLMProvider):
     """Ollama local LLM provider."""
 
     def __init__(self, base_url: str, model: str, temperature: float = 0.7, max_tokens: int = 4096) -> None:
+        super().__init__()
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self._client: Optional[httpx.AsyncClient] = None
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=60.0)
-        return self._client
 
     async def complete(self, messages: list[Message], stream: bool = False) -> str | AsyncIterator[str]:
-        client = await self._get_client()
+        client = await self._client_for(60.0)
 
         payload = {
             "model": self.model,
@@ -82,33 +103,26 @@ class OllamaProvider(LLMProvider):
                     except json.JSONDecodeError:
                         pass
 
-    async def close(self) -> None:
-        if self._client:
-            await self._client.aclose()
-            self._client = None
-
 
 class OpenAIProvider(LLMProvider):
     """OpenAI API provider."""
 
     def __init__(self, api_key: str, model: str, temperature: float = 0.7, max_tokens: int = 4096) -> None:
+        super().__init__()
         self.api_key = api_key
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self._client: Optional[httpx.AsyncClient] = None
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url="https://api.openai.com/v1",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=60.0,
-            )
-        return self._client
+    async def _openai_client(self) -> httpx.AsyncClient:
+        return await self._client_for(
+            60.0,
+            base_url="https://api.openai.com/v1",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+        )
 
     async def complete(self, messages: list[Message], stream: bool = False) -> str | AsyncIterator[str]:
-        client = await self._get_client()
+        client = await self._openai_client()
 
         payload = {
             "model": self.model,
@@ -142,37 +156,30 @@ class OpenAIProvider(LLMProvider):
                     except json.JSONDecodeError:
                         pass
 
-    async def close(self) -> None:
-        if self._client:
-            await self._client.aclose()
-            self._client = None
-
 
 class AnthropicProvider(LLMProvider):
     """Anthropic API provider."""
 
     def __init__(self, api_key: str, model: str, temperature: float = 0.7, max_tokens: int = 4096) -> None:
+        super().__init__()
         self.api_key = api_key
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self._client: Optional[httpx.AsyncClient] = None
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url="https://api.anthropic.com/v1",
-                headers={
-                    "x-api-key": self.api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                timeout=60.0,
-            )
-        return self._client
+    async def _anthropic_client(self) -> httpx.AsyncClient:
+        return await self._client_for(
+            60.0,
+            base_url="https://api.anthropic.com/v1",
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+        )
 
     async def complete(self, messages: list[Message], stream: bool = False) -> str | AsyncIterator[str]:
-        client = await self._get_client()
+        client = await self._anthropic_client()
 
         # Convert messages: system prompt separate, rest as user/assistant
         system = ""
@@ -213,11 +220,6 @@ class AnthropicProvider(LLMProvider):
                             yield data["delta"]["text"]
                     except json.JSONDecodeError:
                         pass
-
-    async def close(self) -> None:
-        if self._client:
-            await self._client.aclose()
-            self._client = None
 
 
 class LLMEngine:
@@ -276,14 +278,40 @@ Be proactive but not verbose. Use a professional yet friendly tone."""
             return self._providers.get(name)
         return self._default_provider
 
+    def set_model(self, model: str) -> bool:
+        """Switch the active Ollama model at runtime."""
+        provider = self._providers.get(self.config.llm.default_provider)
+        if isinstance(provider, OllamaProvider):
+            if provider.model != model:
+                logger.info(f"LLM model switched: {provider.model} -> {model}")
+                provider.model = model
+            return True
+        return False
+
+    def get_model(self) -> Optional[str]:
+        """Return the currently active model name."""
+        provider = self._providers.get(self.config.llm.default_provider)
+        if isinstance(provider, OllamaProvider):
+            return provider.model
+        return None
+
     async def complete(
         self,
         user_input: str,
         provider: Optional[str] = None,
         system_prompt: Optional[str] = None,
         stream: bool = False,
+        history: Optional[list[Message]] = None,
     ) -> str | AsyncIterator[str]:
-        """Complete a user request."""
+        """Complete a user request.
+
+        Args:
+            user_input: The latest user message.
+            provider: Provider name override.
+            system_prompt: System prompt override.
+            stream: Stream the response.
+            history: Prior turns (user/assistant) for conversational context.
+        """
         # Lazy initialize providers if not yet loaded
         if not self._providers:
             await self.initialize()
@@ -293,6 +321,11 @@ Be proactive but not verbose. Use a professional yet friendly tone."""
             raise RuntimeError("No LLM provider available")
 
         messages = [Message(role="system", content=system_prompt or self._system_prompt)]
+        if history:
+            # Keep only role/content pairs, drop malformed entries
+            for m in history:
+                if getattr(m, "role", None) in ("user", "assistant") and getattr(m, "content", None):
+                    messages.append(Message(role=m.role, content=m.content))
         messages.append(Message(role="user", content=user_input))
 
         return await llm_provider.complete(messages, stream=stream)
@@ -334,3 +367,29 @@ def get_llm_engine() -> LLMEngine:
     if _llm_engine is None:
         _llm_engine = LLMEngine()
     return _llm_engine
+
+
+async def list_installed_models() -> list[str]:
+    """Return models actually installed in the local Ollama server."""
+    cfg = get_config()
+    ollama_cfg = cfg.llm.providers.get("ollama")
+    if not ollama_cfg:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{ollama_cfg.base_url.rstrip('/')}/api/tags")
+            r.raise_for_status()
+            return [m["name"] for m in r.json().get("models", [])]
+    except Exception as e:
+        logger.debug(f"Could not list Ollama models: {e}")
+        return []
+
+
+async def available_models() -> list[str]:
+    """Models offered to the user: configured ones that are installed, else all installed."""
+    cfg = get_config()
+    installed = await list_installed_models()
+    if not installed:
+        return list(cfg.llm.available_models)
+    configured = [m for m in cfg.llm.available_models if m in installed]
+    return configured or installed

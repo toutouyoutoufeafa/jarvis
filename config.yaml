@@ -34,6 +34,9 @@ tts:
 
 llm:
   default_provider: "ollama"    # ollama / openai / anthropic
+  available_models:             # Modeles proposes dans l'interface
+    - "nemotron-3-nano:4b"      # Bon francais, creatif
+    - "qwen2.5:3b"              # Plus rapide, plus leger
   providers:
     ollama:
       base_url: "http://localhost:11434"

@@ -10,6 +10,31 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Number of past exchanges (user+assistant pairs) sent to the LLM
+MAX_HISTORY_TURNS = 10
+
+# System prompt: persona + few-shot examples + behaviour rules
+SYSTEM_PROMPT = """Tu es JARVIS, l'assistant IA personnel de Tony (inspire d'Iron Man).
+Tu reponds TOUJOURS en francais, de facon concise et utile.
+
+REGLES:
+- Sois direct: reponds en 1 a 4 phrases sauf si on te demande du detail.
+- Tu as acces a des outils (fichiers, shell, web, git). Si une action est demandee,
+  fais-la ou explique exactement la commande a executer.
+- Tu te souviens des echanges precedents: appelle l'utilisateur Tony.
+- Si tu ne sais pas, dis-le franchement au lieu d'inventer.
+- N'utilise pas de markdown lourd dans le chat: du texte simple.
+
+EXEMPLES:
+Utilisateur: Bonjour
+JARVIS: Bonjour Tony. Je suis en ligne et pret a travailler.
+
+Utilisateur: Tu t'en souviens?
+JARVIS: Oui, on a discute plus tot dans cette session. Quoi de neuf?
+
+Utilisateur: Cree un fichier test.py
+JARVIS: Je vais creer test.py avec un script de base."""
+
 # Configure page
 st.set_page_config(
     page_title="JARVIS - AI Assistant",
@@ -130,11 +155,17 @@ async def check_llm_available() -> bool:
         return False
 
 
-async def process_user_message(text: str, use_agent: bool = True) -> str:
-    """Process user message through JARVIS with smart routing."""
-    agent_core = st.session_state.agent_core
-    llm_available = st.session_state.get("llm_available", False)
+async def process_user_message(
+    text: str,
+    messages_snapshot: list[dict],
+    llm_available: bool = False,
+    llm_model: str | None = None,
+) -> str:
+    """Process user message through JARVIS with smart routing.
 
+    NOTE: runs in a worker thread, so it must NOT touch ``st.session_state``.
+    All session data is passed in explicitly by ``send_message``.
+    """
     # Step 1: Check if it matches a known intent (system commands, files, etc.)
     from jarvis.intent import get_intent_recognizer, get_action_executor
     recognizer = get_intent_recognizer()
@@ -147,12 +178,24 @@ async def process_user_message(text: str, use_agent: bool = True) -> str:
 
     # Step 2: If LLM available, use direct chat (faster than agent for small models)
     if llm_available:
-        from jarvis.llm import get_llm_engine
+        from jarvis.llm import get_llm_engine, Message
         llm = get_llm_engine()
         try:
+            # Apply user-selected model (persists across reruns)
+            if llm_model:
+                llm.set_model(llm_model)
+
+            # Rebuild conversation history so JARVIS remembers previous turns
+            history = [
+                Message(role=m["role"], content=m["content"])
+                for m in messages_snapshot[:-1]  # exclude current user msg
+                if m.get("role") in ("user", "assistant")
+            ][-MAX_HISTORY_TURNS * 2:]  # cap context size
+
             response = await llm.complete(
                 text,
-                system_prompt="Tu es JARVIS, un assistant IA personnel inspire d'Iron Man. Reponds en francais, de maniere concise et utile. Si la tache necessite des outils (fichiers, shell, etc.), reponds DIRECT avec ce que tu ferais."
+                system_prompt=SYSTEM_PROMPT,
+                history=history,
             )
             return response
         except Exception as e:
@@ -171,10 +214,18 @@ def send_message(text: str, use_agent: bool = True):
         "timestamp": datetime.now()
     })
 
+    # Snapshot session data HERE (main thread) before entering the worker thread
+    snapshot = [dict(m) for m in st.session_state.messages]
+
     # Get response
     with st.spinner("JARVIS reflechit..."):
         try:
-            response = run_async(process_user_message(text, use_agent))
+            response = run_async(process_user_message(
+                text,
+                snapshot,
+                llm_available=st.session_state.get("llm_available", False),
+                llm_model=st.session_state.get("llm_model"),
+            ))
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": response,
@@ -187,6 +238,34 @@ def send_message(text: str, use_agent: bool = True):
                 "content": f"Erreur: {str(e)}\n\n```\n{traceback.format_exc()}\n```",
                 "timestamp": datetime.now()
             })
+
+
+def render_model_selector():
+    """Let the user switch the active local LLM at runtime."""
+    from jarvis.llm import get_llm_engine, available_models
+
+    if "model_options" not in st.session_state:
+        try:
+            st.session_state.model_options = run_async(available_models())
+        except Exception:
+            st.session_state.model_options = []
+
+    options = st.session_state.model_options
+    if not options:
+        st.caption("Aucun modele local detecte")
+        return
+
+    llm = get_llm_engine()
+    current = st.session_state.get("llm_model") or llm.get_model() or options[0]
+    if current not in options:
+        current = options[0]
+
+    selected = st.selectbox("Modele local", options, index=options.index(current),
+                            help="nemotron = meilleur francais | qwen = plus rapide")
+    if selected != current:
+        llm.set_model(selected)
+        st.session_state.llm_model = selected
+        st.rerun()
 
 
 def render_sidebar():
@@ -205,6 +284,7 @@ def render_sidebar():
             llm_ok = st.session_state.get("llm_available", False)
             if llm_ok:
                 st.success("LLM: Disponible (Agent ReAct)")
+                render_model_selector()
             else:
                 st.warning("LLM: Indisponible (Mode Intentions)")
 

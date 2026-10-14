@@ -48,6 +48,8 @@ class LLMProviderConfig(BaseSettings):
 class LLMConfig(BaseSettings):
     default_provider: str = "ollama"
     providers: dict[str, LLMProviderConfig] = Field(default_factory=dict)
+    # Models offered in the UI selector (intersected with what Ollama actually has)
+    available_models: list[str] = Field(default_factory=list)
 
 
 class SystemControlConfig(BaseSettings):
