@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -24,28 +26,38 @@ class TTSEngine:
         self.event_bus = get_event_bus()
         self._piper_path: Optional[Path] = None
         self._voice_path: Optional[Path] = None
+        # Actual output rate of the last synthesis. Piper's medium voices
+        # render at 22050 Hz, so callers must not assume the mic rate.
+        self.sample_rate: int = 16000
 
     async def initialize(self) -> None:
         if self.config.tts.engine == "piper":
             await self._init_piper()
 
+    def _find_piper(self) -> Optional[Path]:
+        """Locate the Piper binary.
+
+        An exit-code probe is useless here: ``piper --version`` exits with
+        code 2 on current releases, which made the old check reject a
+        perfectly good install. Resolve the executable instead.
+        """
+        candidates = [
+            shutil.which("piper"),
+            str(Path.home() / ".local" / "bin" / "piper"),
+            str(Path(sys.executable).parent / "Scripts" / "piper.exe"),
+            str(Path(sys.executable).parent / "piper"),
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return Path(candidate)
+        return None
+
     async def _init_piper(self) -> None:
         """Find or download Piper binary and voice model."""
-        # Check for piper in PATH or local
-        try:
-            result = subprocess.run(["piper", "--version"], capture_output=True, text=True)
-            if result.returncode == 0:
-                self._piper_path = Path("piper")
-                logger.info("Found Piper in PATH")
-        except FileNotFoundError:
-            pass
-
-        # Check local bin directory
-        local_bin = Path.home() / ".local" / "bin" / "piper"
-        if local_bin.exists():
-            self._piper_path = local_bin
-
-        if self._piper_path is None:
+        self._piper_path = self._find_piper()
+        if self._piper_path:
+            logger.info(f"Found Piper: {self._piper_path}")
+        else:
             logger.warning("Piper not found. Install with: pip install piper-tts")
             logger.warning("Or download from: https://github.com/rhasspy/piper/releases")
 
@@ -72,7 +84,17 @@ class TTSEngine:
             logger.warning(f"Voice not found: {voice_name}. Download from https://huggingface.co/rhasspy/piper-voices")
 
     async def synthesize(self, text: str) -> np.ndarray:
-        """Synthesize text to audio (int16 array)."""
+        """Synthesize text to audio (int16 array).
+
+        Self-initializing, like ``STTEngine.transcribe``: requiring an
+        explicit ``initialize()`` first only served to make the obvious
+        call raise. The real output rate is recorded on ``sample_rate``
+        because Piper voices are usually 22050 Hz, not the 16000 Hz that
+        speech-to-text assumes.
+        """
+        if self.config.tts.engine == "piper" and self._piper_path is None:
+            await self.initialize()
+
         engine = self.config.tts.engine
 
         if engine == "piper":
@@ -86,7 +108,12 @@ class TTSEngine:
 
     async def _synthesize_piper(self, text: str) -> np.ndarray:
         if self._piper_path is None or self._voice_path is None:
-            raise RuntimeError("Piper not initialized. Run initialize() first.")
+            await self.initialize()
+        if self._piper_path is None or self._voice_path is None:
+            raise RuntimeError(
+                "Piper or its voice is missing. Install piper-tts and download "
+                "a voice into ~/.local/share/piper/voices/."
+            )
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = Path(tmp.name)
@@ -112,8 +139,9 @@ class TTSEngine:
             if proc.returncode != 0:
                 raise RuntimeError(f"Piper failed: {stderr.decode()}")
 
-            # Load generated audio
-            audio_data, _ = sf.read(tmp_path, dtype='int16')
+            # Load generated audio, keeping the rate it was rendered at
+            audio_data, rate = sf.read(tmp_path, dtype='int16')
+            self.sample_rate = int(rate)
             return audio_data
 
         finally:

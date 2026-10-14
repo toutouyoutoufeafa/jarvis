@@ -27,6 +27,9 @@ class STTConfig(BaseSettings):
     compute_type: str = "auto"
     language: str = "fr"
     beam_size: int = 5
+    # Words Whisper should bias towards. Without it, "JARVIS" regularly
+    # comes back as "Jarville".
+    hotwords: str = "JARVIS Tony"
 
 
 class TTSConfig(BaseSettings):

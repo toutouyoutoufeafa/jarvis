@@ -45,39 +45,55 @@ class STTEngine:
         self._loading = False
         logger.info("STT model loaded")
 
+    def _resample(self, audio: np.ndarray, src_rate: int, dst_rate: int = 16000) -> np.ndarray:
+        """Linear resample to the rate Whisper expects.
+
+        Piper's voices render at 22050 Hz. Handing that audio to Whisper as
+        if it were 16000 Hz plays it ~28% too fast, which is exactly the
+        kind of garbling that looks like a model problem but is not.
+        """
+        if src_rate == dst_rate or src_rate <= 0:
+            return audio
+        target_len = int(round(len(audio) * dst_rate / src_rate))
+        src_x = np.linspace(0.0, 1.0, num=len(audio), endpoint=False)
+        dst_x = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+        return np.interp(dst_x, src_x, audio).astype(audio.dtype, copy=False)
+
+    def _prepare_audio(self, audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Resample and normalise to the float32 waveform Whisper wants."""
+        audio = self._resample(audio_data, sample_rate).astype(np.float32)
+        if audio.size and np.abs(audio).max() > 1.0:
+            audio = audio / 32768.0  # int16 -> [-1, 1]
+        return audio
+
     async def transcribe(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
         """Transcribe audio to text."""
         if self._model is None:
             await self.initialize()
 
-        # Save to temporary WAV file (faster-whisper works best with files)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-            # Ensure correct format: mono, 16kHz, int16
-            if sample_rate != 16000:
-                # Resample would go here, for now assume 16kHz
-                pass
-            sf.write(tmp_path, audio_data, sample_rate, subtype='PCM_16')
+        # Pass the waveform straight to the model. Writing a WAV and handing
+        # over the path routes through PyAV's decode_audio, which is broken
+        # against the installed av build ("metadata_errors" was rejected),
+        # and costs a disk round-trip for nothing.
+        audio = self._prepare_audio(audio_data, sample_rate)
 
-        try:
-            loop = asyncio.get_event_loop()
-            segments, info = await loop.run_in_executor(
-                None,
-                lambda: self._model.transcribe(
-                    str(tmp_path),
-                    language=self.config.stt.language,
-                    beam_size=self.config.stt.beam_size,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=500),
-                )
+        loop = asyncio.get_event_loop()
+        segments, info = await loop.run_in_executor(
+            None,
+            lambda: self._model.transcribe(
+                audio,
+                language=self.config.stt.language,
+                beam_size=self.config.stt.beam_size,
+                # Without this Whisper happily renders "JARVIS" as "Jarville".
+                hotwords=self.config.stt.hotwords or None,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
             )
+        )
 
-            text = " ".join(seg.text for seg in segments).strip()
-            logger.debug(f"STT result: '{text}' (lang: {info.language}, prob: {info.language_probability:.2f})")
-            return text
-
-        finally:
-            tmp_path.unlink(missing_ok=True)
+        text = " ".join(seg.text for seg in segments).strip()
+        logger.debug(f"STT result: '{text}' (lang: {info.language}, prob: {info.language_probability:.2f})")
+        return text
 
     async def process_event(self, event: Event) -> None:
         """Handle STT_START event."""
