@@ -2,12 +2,50 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
+from typing import Any
+
 from loguru import logger
 
 from jarvis.plugins import Plugin, PluginMetadata
 from jarvis.intent import Action, get_intent_recognizer
 from jarvis.events import get_event_bus, Events, Event
+
+# PowerShell must be told to emit UTF-8, and Python must capture raw bytes
+# and decode that way: with text=True it decodes with the locale codepage
+# (cp1252 here), which mangles any accented window title and makes the
+# JSON parse fail with a confusing error.
+_UTF8_PREAMBLE = (
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+    "$OutputEncoding = [Text.Encoding]::UTF8; "
+)
+
+
+async def run_powershell(command: str, timeout: float = 30.0) -> str:
+    """Run a PowerShell snippet and return its UTF-8 decoded stdout."""
+    result = await asyncio.to_thread(
+        subprocess.run,
+        ["powershell", "-NoProfile", "-Command", _UTF8_PREAMBLE + command],
+        capture_output=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="replace").strip()
+                           or f"powershell exited with {result.returncode}")
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def parse_json(text: str) -> Any:
+    """Parse PowerShell JSON, tolerating empty output."""
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning(f"Unparseable PowerShell JSON: {text[:200]!r}")
+        return None
 
 
 class WindowManagerAction(Action):
@@ -39,24 +77,24 @@ class WindowManagerAction(Action):
             return f"Erreur: {e}"
 
     async def _list_windows(self) -> str:
-        # Use PowerShell to get window titles
+        """List every process that owns a visible window."""
         cmd = """
         Get-Process | Where-Object {$_.MainWindowTitle -ne ""} |
         Select-Object ProcessName, MainWindowTitle, Id |
         ConvertTo-Json
         """
-        result = await asyncio.to_thread(
-            subprocess.run, ["powershell", "-Command", cmd],
-            capture_output=True, text=True
-        )
-        if result.stdout:
-            import json
-            windows = json.loads(result.stdout)
-            if isinstance(windows, dict):
-                windows = [windows]
-            lines = [f"  {w['ProcessName']} (PID:{w['Id']}): {w['MainWindowTitle'][:60]}" for w in windows[:10]]
-            return "Fenêtres ouvertes:\n" + "\n".join(lines)
-        return "Aucune fenêtre trouvée"
+        windows = parse_json(await run_powershell(cmd))
+        if not windows:
+            return "Aucune fenêtre trouvée"
+
+        if isinstance(windows, dict):
+            windows = [windows]
+
+        lines = [
+            f"  {w['ProcessName']} (PID:{w['Id']}): {str(w['MainWindowTitle'])[:60]}"
+            for w in windows[:10]
+        ]
+        return "Fenêtres ouvertes:\n" + "\n".join(lines)
 
     async def _window_action(self, action: str, target: str) -> str:
         # Map actions to PowerShell commands
@@ -74,22 +112,17 @@ class WindowManagerAction(Action):
         }} | Select-Object -First 1
         if ($proc) {{ $proc.Id }} else {{ exit 1 }}
         """
-        result = await asyncio.to_thread(
-            subprocess.run, ["powershell", "-Command", find_cmd],
-            capture_output=True, text=True
-        )
-
-        if result.returncode != 0 or not result.stdout.strip():
+        try:
+            pid = (await run_powershell(find_cmd, timeout=15.0)).strip()
+        except RuntimeError:
             return f"Fenêtre non trouvée: {target}"
 
-        pid = result.stdout.strip()
+        if not pid:
+            return f"Fenêtre non trouvée: {target}"
 
         # Execute action
         action_cmd = f"$pid = {pid}; {actions[action]}"
-        await asyncio.to_thread(
-            subprocess.run, ["powershell", "-Command", action_cmd],
-            capture_output=True
-        )
+        await run_powershell(action_cmd, timeout=15.0)
 
         return f"Fenêtre {target}: {action} effectuée"
 
@@ -107,23 +140,31 @@ class NetworkInfoAction(Action):
 
     async def execute(self, entities: dict[str, str], raw_text: str) -> str:
         try:
-            cmd = "Get-NetIPConfiguration | Select-Object InterfaceAlias, IPv4Address, DNSServer | ConvertTo-Json"
-            result = await asyncio.to_thread(
-                subprocess.run, ["powershell", "-Command", cmd],
-                capture_output=True, text=True
-            )
-            if result.stdout:
-                import json
-                data = json.loads(result.stdout)
-                if isinstance(data, dict):
-                    data = [data]
-                lines = []
-                for d in data:
-                    ips = d.get("IPv4Address", [])
-                    ip_str = ", ".join([ip["IPAddress"] for ip in ips]) if ips else "N/A"
-                    lines.append(f"  {d['InterfaceAlias']}: {ip_str}")
-                return "Interfaces réseau:\n" + "\n".join(lines)
-            return "Aucune interface trouvée"
+            # -ExpandProperty style shaping matters here: ConvertTo-Json
+            # serialises a CIM object into an unreadable string, so the
+            # real values are pulled out in PowerShell first.
+            cmd = """
+            Get-NetIPConfiguration | ForEach-Object {
+                [pscustomobject]@{
+                    InterfaceAlias = $_.InterfaceAlias
+                    IPs = (@($_.IPv4Address) | ForEach-Object { $_.IPAddress |
+                         Where-Object { $_ -match '^\\d+\\.' } }) -join ', '
+                }
+            } | ConvertTo-Json
+            """
+            data = parse_json(await run_powershell(cmd, timeout=20.0))
+            if not data:
+                return "Aucune interface trouvée"
+
+            if isinstance(data, dict):
+                data = [data]
+
+            lines = [
+                f"  {d['InterfaceAlias']}: {d.get('IPs') or 'N/A'}"
+                for d in data if d.get("InterfaceAlias")
+            ]
+            return "Interfaces réseau:\n" + "\n".join(lines) if lines \
+                else "Aucune interface trouvée"
         except Exception as e:
             return f"Erreur: {e}"
 

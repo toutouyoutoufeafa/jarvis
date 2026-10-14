@@ -28,6 +28,9 @@ INTENT_LLM_OPTIONS = {"num_predict": 48, "temperature": 0.0}
 # Budget for the executor's general-chat fallback.
 CHAT_LLM_OPTIONS = {"num_predict": 300, "temperature": 0.7}
 
+# How long a caller may wait for a plugin to answer an intent.
+PLUGIN_ANSWER_TIMEOUT = 10.0
+
 
 @dataclass
 class Intent:
@@ -35,6 +38,10 @@ class Intent:
     confidence: float
     entities: dict[str, str]
     raw_text: str
+    # Optional answer contributed by a plugin that subscribed to
+    # INTENT_RECOGNIZED. Lets extensions answer a turn without owning the
+    # routing, which is how the weather plugin is reached.
+    answer: str | None = None
 
 
 class Action(ABC):
@@ -424,22 +431,22 @@ Demande: "{text}"
 
 JSON:"""
 
-    async def recognize(self, text: str) -> Intent:
+    async def recognize(self, text: str, wait_for_plugins: bool = True) -> Intent:
         """Recognize intent from text.
 
-        Deterministic rules run first and cost nothing. The LLM is only
-        consulted for phrasings the rules miss -- at the provider default
-        budget a single classification round-trip measured 14-17s on this
-        CPU-only machine, i.e. more than the answer itself.
+        Deterministic rules always run first and cost nothing. Everything
+        else -- asking the LLM, waiting for a plugin -- happens only when no
+        rule matched, so a recognised command is answered instantly.
         """
         rule_intent = self._fallback_recognize(text)
         if rule_intent.name != "chat":
-            await self._emit(rule_intent)
+            await self._emit(rule_intent, wait=wait_for_plugins)
             return rule_intent
 
-        # A plain question ("pourquoi ...?", "c'est quoi ...?") is chat by
-        # construction, and paying an LLM round-trip to confirm that is the
-        # single biggest avoidable latency in the chat path.
+        # Everything below is an unrecognised turn: it is either real
+        # conversation or a command phrased oddly. Questions go straight to
+        # chat -- asking the model to confirm "pourquoi ...?" is a chat is
+        # the single biggest avoidable latency in the chat path.
         if self._looks_like_question(text):
             await self._emit(rule_intent)
             return rule_intent
@@ -458,7 +465,7 @@ JSON:"""
                     entities=data.get("entities") or {},
                     raw_text=text,
                 )
-                await self._emit(intent)
+                await self._emit(intent, wait=wait_for_plugins)
                 return intent
         except Exception as e:
             logger.error(f"Intent recognition failed: {e}")
@@ -466,13 +473,42 @@ JSON:"""
         await self._emit(rule_intent)
         return rule_intent
 
-    async def _emit(self, intent: Intent) -> None:
-        await self.event_bus.emit(Event(Events.INTENT_RECOGNIZED, {
+    async def _emit(self, intent: Intent, wait: bool = False) -> None:
+        """Publish the intent, optionally letting plugins answer it.
+
+        The bus is fire-and-forget by design, so subscribers only run when
+        a caller asks (``wait_for_plugins``) -- otherwise every chat turn
+        would pay for whatever an extension happens to be doing. A plugin
+        answers by writing to ``event.data["answer"]``; a handler that
+        raises is logged and ignored, and a slow one is cancelled rather
+        than allowed to stall the conversation.
+        """
+        event = Event(Events.INTENT_RECOGNIZED, {
             "intent": intent.name,
             "confidence": intent.confidence,
             "entities": intent.entities,
             "raw_text": intent.raw_text,
-        }))
+        })
+
+        if not wait:
+            await self.event_bus.emit(event)
+            return
+
+        task = asyncio.create_task(self.event_bus.emit(event))
+        done, _ = await asyncio.wait({task}, timeout=PLUGIN_ANSWER_TIMEOUT)
+        if not done:
+            task.cancel()
+            logger.warning(
+                f"Plugin did not answer {intent.name!r} within "
+                f"{PLUGIN_ANSWER_TIMEOUT:.0f}s; continuing without it"
+            )
+            return
+
+        answer = event.data.get("answer")
+        if asyncio.iscoroutine(answer):
+            answer = await answer
+        if answer:
+            intent.answer = str(answer)
 
     @staticmethod
     def _looks_like_question(text: str) -> bool:
@@ -492,6 +528,22 @@ JSON:"""
         # Simple patterns. Infinitive and question forms matter: "peux-tu
         # ouvrir chrome ?" must not be mistaken for small talk.
         patterns = [
+            # Weather, answered by the weather plugin.
+            # (?![\w]) keeps "meteorologue" from matching, and the trailing
+            # group must be optional so a bare "meteo" still matches.
+            (r"(?:quelle\s+|la\s+)?m[eé]t[eé]o(?![\w])\s*(?:[àa]\s+|pour\s+|sur\s+)?([\w\s'-]{2,40}?)?\s*\??$",
+             "weather_current", {"location": r"\1"}),
+            (r"(?:quelle\s+)?pr[eé]visions?(?![\w])\s*(?:de\s+m[eé]t[eé]o\s*)?(?:[àa]\s+|pour\s+|sur\s+)?([\w\s'-]{2,40}?)?\s*\??$",
+             "weather_forecast", {"location": r"\1"}),
+
+            # Windows and network, handled by the system_control plugin.
+            (r"(liste|lister|affiche|montre)\s*(?:-moi\s+)?(?:les\s+)?(fen[eê]tres?|windows?)", "window_manager", {"action": "list"}),
+            (r"(minimi[sz]er?|r[eé]duis|r[eé]duire)\s*(?:la\s+)?(fen[eê]tre|window)", "window_manager", {"action": "minimize"}),
+            (r"(maximi[sz]er?|agrandis|agrandir)\s*(?:la\s+)?(fen[eê]tre|window)?", "window_manager", {"action": "maximize"}),
+            (r"(ferme|fermer|ferme\s+la)\s*(?:la\s+)?(fen[eê]tre|window)", "window_manager", {"action": "close"}),
+            (r"(?:info|infos|etat|[ée]tat|configuration)\s+(?:du\s+|de\s+la\s+)?(r[eé]seau|network)", "network_info", {}),
+            (r"(?:adresse\s+ip|mon\s+ip|interfaces?\s+r[eé]seau|r[eé]seau\s+info)", "network_info", {}),
+
             (r"(lance|lancer|ouvre|ouvrir|demarrer|d[eé]marrer)\s+([\w.+-]+)", "launch_app", {"app": r"\2"}),
             (r"(ouvre|ouvrir|va sur)\s+(https?://\S+|\w+\.\w+)", "open_website", {"url": r"\2"}),
             (r"(syst[eè]me|info|status|[ée]tat)", "system_info", {}),
@@ -533,6 +585,14 @@ class ActionExecutor:
 
     async def execute_intent(self, intent: Intent) -> str:
         """Execute an intent and return result."""
+        # A plugin that claimed this intent during recognition already did
+        # the work; running the builtin action would duplicate it.
+        if intent.answer:
+            await self.event_bus.emit(Event(Events.ACTION_RESULT, {
+                "intent": intent.name, "result": intent.answer, "source": "plugin",
+            }))
+            return intent.answer
+
         await self.event_bus.emit(Event(Events.ACTION_EXECUTE, {"intent": intent.name}))
 
         action = self.recognizer.registry.get(intent.name)

@@ -19,12 +19,14 @@ from typing import Iterable, Sequence
 from loguru import logger
 
 from jarvis.agent.memory import get_memory_manager
+from jarvis.config import get_config
 from jarvis.intent import (
     canned_reply,
     get_action_executor,
     get_intent_recognizer,
 )
 from jarvis.llm import Message, get_llm_engine
+from jarvis.plugins import get_plugin_manager
 
 # Number of past exchanges (user+assistant pairs) sent to the LLM.
 # Prompt evaluation runs at ~37 tok/s on this CPU-only box, so every
@@ -118,11 +120,14 @@ async def respond(
     if instant:
         return ChatReply(text=instant, source="intent")
 
+    # Extensions get a chance before the model: the weather plugin answers
+    # a city forecast in ~1s, where the LLM would invent one in ~20s.
+    await _ensure_plugins()
     intent = await get_intent_recognizer().recognize(text)
     if intent.confidence >= INTENT_CONFIDENCE and intent.name != "chat":
         return ChatReply(
             text=await get_action_executor().execute_intent(intent),
-            source="intent",
+            source="plugin" if intent.answer else "intent",
         )
 
     if llm_available:
@@ -160,10 +165,30 @@ async def respond(
 
 def sources() -> Iterable[str]:
     """The routing paths, for diagnostics."""
-    return ("intent", "llm", "fallback")
+    return ("intent", "plugin", "llm", "fallback")
 
 
 _memory_ready = False
+_plugins_ready = False
+
+
+async def _ensure_plugins() -> None:
+    """Load extensions once, so they can answer intents (weather, ...).
+
+    The plugin manager is a singleton with its own guard, so calling this
+    on every turn is cheap after the first.
+    """
+    global _plugins_ready
+    if _plugins_ready:
+        return
+    _plugins_ready = True
+    try:
+        manager = get_plugin_manager()
+        manager.load_all(get_config().plugins.directories)
+        await manager.initialize_all()
+        logger.debug(f"Plugins ready: {[p.name for p in manager.list_plugins()]}")
+    except Exception as exc:  # noqa: BLE001 - extensions are optional
+        logger.warning(f"Plugin load failed: {exc}")
 
 
 async def _memory():
