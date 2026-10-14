@@ -269,6 +269,21 @@ class MemoryManager:
     async def search_ltm(self, query: str, limit: int = 10, filter_metadata: dict | None = None) -> list[MemoryEntry]:
         return await self.ltm.search(query, limit, filter_metadata)
 
+    async def remember_exchange(self, user_text: str, reply: str) -> MemoryEntry:
+        """Persist one conversation turn to long-term memory.
+
+        ``add_stm`` alone is not enough for chat: short-term entries only
+        reach the store once the token budget overflows, so a restart would
+        forget everything the user ever said.
+        """
+        entry = MemoryEntry(
+            id=str(uuid.uuid4()),
+            content=f"Utilisateur: {user_text}\nJARVIS: {reply}",
+            metadata={"type": "chat"},
+        )
+        await self.ltm.add(entry)
+        return entry
+
     async def get_context(self, query: str, max_tokens: int = 3000) -> str:
         """Get relevant context from both STM and LTM.
 

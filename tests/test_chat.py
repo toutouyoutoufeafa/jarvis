@@ -4,8 +4,9 @@ from __future__ import annotations
 import pytest
 
 from jarvis import chat
+from jarvis.agent.memory import MemoryEntry
 from jarvis.chat import ChatReply, build_history, respond
-from jarvis.intent import Intent
+from jarvis.intent import INTENT_LLM_OPTIONS, Intent, IntentRecognizer, canned_reply
 
 
 class _FakeLLM:
@@ -63,11 +64,31 @@ class _FakeExecutor:
         return f"fallback:{text}"
 
 
-def _wire(monkeypatch, recognizer=None, executor=None, llm=None):
+class _FakeMemory:
+    """Records what the chat stored and replays a canned recall."""
+
+    def __init__(self, results: list | None = None) -> None:
+        self.results = results or []
+        self.stored: list[tuple[str, str]] = []
+        self.initialized = 0
+
+    async def initialize(self) -> None:
+        self.initialized += 1
+
+    async def search_ltm(self, query, limit=10, filter_metadata=None):
+        return list(self.results[:limit])
+
+    async def remember_exchange(self, user_text: str, reply: str):
+        self.stored.append((user_text, reply))
+
+
+def _wire(monkeypatch, recognizer=None, executor=None, llm=None, memory=None):
     monkeypatch.setattr(chat, "get_intent_recognizer",
                         lambda: recognizer or _FakeRecognizer("chat", 0.1))
     monkeypatch.setattr(chat, "get_action_executor", lambda: executor or _FakeExecutor())
     monkeypatch.setattr(chat, "get_llm_engine", lambda: llm or _FakeLLM())
+    monkeypatch.setattr(chat, "get_memory_manager", lambda: memory or _FakeMemory())
+    monkeypatch.setattr(chat, "_memory_ready", False)
 
 
 @pytest.mark.asyncio
@@ -138,14 +159,14 @@ class TestRouting:
         llm = _FakeLLM()
         _wire(monkeypatch, llm=llm)
 
-        await respond("salut", model="qwen2.5:3b")
+        await respond("explique la photosynthese", model="qwen2.5:3b")
 
         assert llm.model == "qwen2.5:3b"
 
     async def test_unreachable_model_degrades_instead_of_raising(self, monkeypatch) -> None:
         _wire(monkeypatch, llm=_FakeLLM(fail=True))
 
-        reply = await respond("salut")
+        reply = await respond("explique la photosynthese")
 
         assert reply.source == "fallback"
         assert "hors ligne" in reply.text
@@ -154,10 +175,77 @@ class TestRouting:
         executor = _FakeExecutor()
         _wire(monkeypatch, executor=executor)
 
-        reply = await respond("salut", llm_available=False)
+        reply = await respond("dis-moi un truc", llm_available=False)
 
-        assert reply == ChatReply(text="fallback:salut", source="fallback")
-        assert executor.plain == ["salut"]
+        assert reply == ChatReply(text="fallback:dis-moi un truc", source="fallback")
+        assert executor.plain == ["dis-moi un truc"]
+
+    async def test_a_greeting_needs_no_llm_at_all(self, monkeypatch) -> None:
+        """Even with every model down, 'bonjour' must be answered."""
+        _wire(monkeypatch, executor=_FakeExecutor())
+
+        reply = await respond("bonjour", llm_available=False)
+
+        assert reply.source == "intent"
+        assert "JARVIS" in reply.text
+
+
+@pytest.mark.asyncio
+class TestMemory:
+    """The RAG half of the chat: recall before answering, store after."""
+
+    async def test_recalled_exchanges_are_injected_into_the_prompt(
+        self, monkeypatch
+    ) -> None:
+        llm = _FakeLLM()
+        memory = _FakeMemory(results=[
+            MemoryEntry(id="1", content="Utilisateur: mon fichier s'appelle rapport.py",
+                        metadata={}),
+        ])
+        _wire(monkeypatch, llm=llm, memory=memory)
+
+        reply = await respond("et mon fichier ?")
+
+        assert reply.source == "llm"
+        prompt = llm.calls[0]["user_input"]
+        assert "ECHANGES PASSEES PERTINENTS" in prompt
+        assert "rapport.py" in prompt
+
+    async def test_empty_memory_leaves_the_prompt_untouched(self, monkeypatch) -> None:
+        llm = _FakeLLM()
+        _wire(monkeypatch, llm=llm)
+
+        await respond("explique la photosynthese ?")
+
+        assert llm.calls[0]["user_input"] == "explique la photosynthese ?"
+
+    async def test_every_llm_turn_is_persisted(self, monkeypatch) -> None:
+        llm = _FakeLLM(reply="Voila")
+        memory = _FakeMemory()
+        _wire(monkeypatch, llm=llm, memory=memory)
+
+        await respond("quelle heure est-il ?")
+
+        assert memory.stored == [("quelle heure est-il ?", "Voila")]
+        assert memory.initialized == 1  # opened once, not once per turn
+
+    async def test_memory_outage_never_breaks_the_chat(self, monkeypatch) -> None:
+        class _Broken:
+            async def initialize(self) -> None:
+                raise RuntimeError("chroma mort")
+
+            async def search_ltm(self, *args, **kwargs):
+                raise RuntimeError("chroma mort")
+
+            async def remember_exchange(self, *args, **kwargs):
+                raise RuntimeError("chroma mort")
+
+        _wire(monkeypatch, llm=_FakeLLM(reply="reponse quand meme"),
+              memory=_Broken())
+
+        reply = await respond("c'est quoi un entrelacement ?")
+
+        assert reply == ChatReply(text="reponse quand meme", source="llm")
 
 
 class TestCheapRouting:
@@ -174,7 +262,8 @@ class TestCheapRouting:
 
     def test_small_talk_is_canned_but_follow_ups_are_not(self) -> None:
         assert canned_reply("ça va ?") is not None
-        assert canned_reply("ça va bien, merci") is None
+        # A follow-up on the same topic is still conversation for the model.
+        assert canned_reply("ça va bien, et toi ?") is None
 
     def test_plain_prose_is_left_to_the_model(self) -> None:
         assert canned_reply("explique la photosynthese") is None

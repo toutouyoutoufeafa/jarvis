@@ -16,6 +16,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+from loguru import logger
+
+from jarvis.agent.memory import get_memory_manager
 from jarvis.intent import (
     canned_reply,
     get_action_executor,
@@ -42,6 +45,11 @@ CHAT_MAX_TOKENS = 300
 
 # Confidence at or above which a recognised intent is executed directly.
 INTENT_CONFIDENCE = 0.7
+
+# How much past context a question may pull in. Each entry costs prompt
+# evaluation (~37 tok/s on this box), so this stays deliberately small.
+MEMORY_ENTRIES = 3
+MEMORY_CHARS = 200
 
 SYSTEM_PROMPT = """Tu es JARVIS, l'assistant IA personnel de Tony (inspire d'Iron Man).
 Tu reponds TOUJOURS en francais, de facon concise et utile.
@@ -122,12 +130,23 @@ async def respond(
         if model:
             llm.set_model(model)
         try:
+            # Pull in whatever past exchanges are relevant. This is what
+            # lets JARVIS answer "et mon fichier ?" three sessions later;
+            # an empty memory just yields the bare question.
+            remembered = await recall(text)
+            prompt = text
+            if remembered:
+                prompt = (
+                    f"ECHANGES PASSEES PERTINENTS:\n{remembered}\n\nDemande: {text}"
+                )
+
             response = await llm.complete(
-                text,
+                prompt,
                 system_prompt=SYSTEM_PROMPT,
                 history=build_history(snapshot),
                 options={"num_predict": CHAT_MAX_TOKENS},
             )
+            await remember(text, str(response))
             return ChatReply(text=response, source="llm")
         except Exception as exc:  # noqa: BLE001 - degrade, never crash the chat
             return ChatReply(
@@ -142,3 +161,34 @@ async def respond(
 def sources() -> Iterable[str]:
     """The routing paths, for diagnostics."""
     return ("intent", "llm", "fallback")
+
+
+_memory_ready = False
+
+
+async def _memory():
+    """Lazily initialised shared memory (ChromaDB + embedding model)."""
+    global _memory_ready
+    memory = get_memory_manager()
+    if not _memory_ready:
+        await memory.initialize()
+        _memory_ready = True
+    return memory
+
+
+async def recall(text: str) -> str:
+    """Past exchanges relevant to ``text``, or '' if memory adds nothing."""
+    try:
+        entries = await (await _memory()).search_ltm(text, limit=MEMORY_ENTRIES)
+    except Exception as exc:  # noqa: BLE001 - memory must never break a chat
+        logger.debug(f"Memory recall failed: {exc}")
+        return ""
+    return "\n".join(e.content[:MEMORY_CHARS] for e in entries if e.content)
+
+
+async def remember(text: str, reply: str) -> None:
+    """Persist one exchange to long-term memory (survives restarts)."""
+    try:
+        await (await _memory()).remember_exchange(text, reply)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"Memory store failed: {exc}")

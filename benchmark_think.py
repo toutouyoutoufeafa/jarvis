@@ -1,54 +1,30 @@
-"""Where does a chat turn spend its time?"""
+"""Measure the chat path end to end, including the RAG recall/store."""
 import asyncio
 import time
 
-from jarvis.chat import SYSTEM_PROMPT, build_history
-from jarvis.intent import get_intent_recognizer
-from jarvis.llm import get_llm_engine
+from jarvis import chat
 
 
 async def main() -> None:
-    recognizer = get_intent_recognizer()
-    llm = get_llm_engine()
-    await llm.initialize()
-
     questions = [
         "Bonjour",
-        "C'est quoi la photosynthese ?",
-        "Et pourquoi les feuilles sont-elles vertes ?",
+        "Je m'appelle Tony et mon fichier principal s'appelle rapport.py",
+        "Comment je m'appelle d'apres toi ?",
+        "Et quel est le nom de mon fichier principal ?",
     ]
+
     snapshot: list[dict] = []
-
+    total = 0.0
     for question in questions:
-        t0 = time.perf_counter()
-        await recognizer.recognize(question)
-        t_intent = time.perf_counter() - t0
-
-        history = build_history(snapshot[:-1])
-        t0 = time.perf_counter()
-        response = await llm.complete(
-            question,
-            system_prompt=SYSTEM_PROMPT,
-            history=history,
-            options={"num_predict": chat_tokens()},
-        )
-        t_llm = time.perf_counter() - t0
-
-        prompt_chars = len(SYSTEM_PROMPT) + sum(
-            len(m.content) for m in history
-        ) + len(question)
-        print(
-            f"intent={t_intent:5.2f}s  llm={t_llm:6.2f}s  "
-            f"prompt={prompt_chars:5d} chars (~{prompt_chars // 3} tokens)  "
-            f"reponse={len(response)} chars"
-        )
         snapshot.append({"role": "user", "content": question})
-        snapshot.append({"role": "assistant", "content": response})
+        start = time.perf_counter()
+        reply = await chat.respond(question, snapshot=snapshot[:-1], llm_available=True)
+        elapsed = time.perf_counter() - start
+        total += elapsed
+        snapshot.append({"role": "assistant", "content": reply.text})
+        print(f"tour {elapsed:5.1f}s  source={reply.source:8s} -> {reply.text[:80]!r}")
 
-
-def chat_tokens() -> int:
-    from jarvis.chat import CHAT_MAX_TOKENS
-    return CHAT_MAX_TOKENS
+    print(f"\nTOTAL {total:.1f}s pour {len(questions)} questions")
 
 
 if __name__ == "__main__":

@@ -296,7 +296,9 @@ def canned_reply(text: str) -> str | None:
     Greetings are matched exactly so that "bonjour, pourquoi le ciel est-il
     bleu ?" still goes to the model.
     """
-    stripped = text.strip().lower().rstrip("!?.,;:")
+    stripped = text.strip().lower()
+    # "Bonjour !" and "ça va ?" are as much greetings as the bare forms.
+    stripped = stripped.rstrip("!?.,;:").strip()
     if stripped in ChatAction.GREETINGS:
         return ChatAction.GREETINGS[stripped]
     if any(word in stripped for word in ("merci", "thanks", "thank you")):
